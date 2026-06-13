@@ -1,0 +1,36 @@
+# ngx_http_waf_module - build descriptor
+#
+# Dynamic HTTP module. No external libraries: PCRE2 comes from nginx's
+# own ngx_regex (already linked), and the geo reader is the embedded
+# nanolibloc adaptation (libc only). ngx_module_libs stays empty.
+
+ngx_addon_name=ngx_http_waf_module
+
+waf_deps="$ngx_addon_dir/src/ngx_http_waf.h \
+         $ngx_addon_dir/src/waf_match.h \
+         $ngx_addon_dir/src/waf_spoof.h \
+         $ngx_addon_dir/src/waf_geo.h \
+         $ngx_addon_dir/src/waf_reputation.h \
+         $ngx_addon_dir/src/waf_authhttp.h"
+
+waf_srcs="$ngx_addon_dir/src/ngx_http_waf_module.c \
+         $ngx_addon_dir/src/waf_match.c \
+         $ngx_addon_dir/src/waf_spoof.c \
+         $ngx_addon_dir/src/waf_geo.c \
+         $ngx_addon_dir/src/waf_reputation.c \
+         $ngx_addon_dir/src/waf_authhttp.c"
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_waf_module
+    ngx_module_incs="$ngx_addon_dir/src"
+    ngx_module_deps="$waf_deps"
+    ngx_module_srcs="$waf_srcs"
+    ngx_module_libs=
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES ngx_http_waf_module"
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $waf_deps"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $waf_srcs"
+    CORE_INCS="$CORE_INCS $ngx_addon_dir/src"
+fi

@@ -1,0 +1,21 @@
+# CMake super-build outputs
+/build/
+/dist/
+
+# build-time downloads / extracted trees (all fetched by CMake now)
+/openssl-*.tar.gz
+/nginx-*.tar.gz
+/zlib-ng-*.tar.gz
+/openssl-*/
+/nginx-*/
+/zlib-ng-*/
+
+# geo database (downloaded artifact, not source)
+geodb/*.db
+geodb/*.db.*
+
+# sandbox runtime
+sandbox/logs/
+
+# editor / tooling state
+.claude/

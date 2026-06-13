@@ -1,0 +1,113 @@
+# ngx_http_waf_module - scanner path blocklist
+#
+# Format: one PCRE2 pattern per line, optional trailing action token.
+#   <pattern>[ <action>]      action in { 404 (default), 403, 444 }
+#
+# Patterns are matched case-insensitively against the normalized request
+# URI (r->uri). ANCHOR every pattern with ^ so a path component cannot be
+# matched mid-URI (the legacy nginx-firewall.conf had unanchored `~* html`
+# style rules that blocked legitimate paths like /index.html). Patterns
+# sharing an action are compiled into one alternation regex.
+#
+# This file is hot-reloadable: `nginx -s reload` re-reads and recompiles it.
+
+# ---- WordPress -------------------------------------------------------------
+^/wp-
+^/xmlrpc\.php$
+^/wordpress/
+
+# ---- VCS / secrets / dotfiles ---------------------------------------------
+^/\.git
+^/\.svn
+^/\.hg
+^/\.env
+^/\.aws/
+^/\.ssh/
+^/\.DS_Store$
+^/\.vscode/
+^/\.well-known/(?!acme-challenge/)
+^/config\.json$
+^/web\.config$
+
+# ---- backups / dumps -------------------------------------------------------
+^/backup\.(zip|sql|tar\.gz|tgz|rar)$
+^/dump\.sql$
+^/db\.sql$
+^/database\.sql$
+^/.*\.bak$
+
+# ---- PHP / framework probes -----------------------------------------------
+^/phpinfo\.php$
+^/info\.php$
+^/phpmyadmin/ 403
+^/pma/ 403
+^/vendor/phpunit/
+^/_ignition/execute-solution$
+^/telescope/requests$
+
+# ---- mail / exchange / OWA -------------------------------------------------
+^/owa
+^/ecp
+^/autodiscover
+^/Autodiscover
+^/exchange/
+
+# ---- appliances / RCE-prone endpoints -------------------------------------
+^/remote/fgt_lang
+^/api/v2/cmdb/system/admin/admin
+^/HNAP1
+^/boaform/
+^/cgi-bin/
+^/actuator
+^/geoserver
+^/solr/
+^/manager/(html|text)
+^/login\.action$
+^/struts
+^/v2/_catalog$
+^/_all_dbs$
+^/dns-query
+^/resolve\?
+
+# ---- generic admin / installer probes -------------------------------------
+^/administrator
+^/ReportServer
+^/Temporary_Listen_Addresses
+
+# ---- known nmap / scanner fingerprints ------------------------------------
+^/nmaplowercheck
+^/HNAP1$
+^/sdk$
+
+# ---- noisy junk paths from the legacy list (random scanner tokens) --------
+^/1rRg$
+^/99vt$
+^/aaa9$
+^/aab8$
+^/aab9$
+^/4Wnc$
+^/Flr9$
+^/6ckX$
+^/0xZZ$
+^/jITU$
+^/oEq7$
+^/MNLu$
+^/nJo5$
+^/WLIp$
+^/pEWP$
+^/__Additional
+
+# ---- misc scanner targets --------------------------------------------------
+^/3rdpartylicenses\.txt$
+^/localizations/zh\.json$
+^/CSS/Miniweb\.css$
+^/Portal/Portal\.mwsl$
+^/Portal0000\.htm$
+^/viwwwsogou$
+^/c/msdownload
+^/readme\.txt$
+^/users/sign_in$
+^/confluence/rest/applinks/
+
+# ---- extensions that should never be served at this edge ------------------
+^/.*\.(cgi|asp|aspx|jsp|jsa|cfm|pl)$
