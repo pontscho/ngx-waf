@@ -1,6 +1,5 @@
 # CMake super-build outputs
 /build/
-/dist/
 
 # build-time downloads / extracted trees (all fetched by CMake now)
 /openssl-*.tar.gz
@@ -14,8 +13,12 @@
 geodb/*.db
 geodb/*.db.*
 
-# sandbox runtime
+# sandbox runtime + build-installed nginx (prefix = sandbox/)
+sandbox/sbin/
+sandbox/modules/
+sandbox/conf/
 sandbox/logs/
+sandbox/*_temp/
 
 # editor / tooling state
 .claude/

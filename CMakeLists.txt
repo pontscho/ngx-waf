@@ -3,11 +3,11 @@
 #
 #   cmake -B build -S .          # configure: declare the 3 ExternalProjects
 #   cmake --build build -j       # fetch + build zlib-ng, fetch OpenSSL src,
-#                                #   build nginx + WAF module, install -> dist/
+#                                #   build nginx + WAF module, install -> sandbox/
 #
-# Produces:
-#   dist/sbin/nginx                       (OpenSSL 3.5.7 + static zlib-ng)
-#   dist/modules/ngx_http_waf_module.so   (the WAF dynamic module)
+# Produces (installed into the runnable sandbox/ tree):
+#   sandbox/sbin/nginx                       (OpenSSL 3.5.7 + static zlib-ng)
+#   sandbox/modules/ngx_http_waf_module.so   (the WAF dynamic module)
 #
 # Dependency chain:
 #   zlibng_ext  --(static libz.a + zlib.h)--\
@@ -27,7 +27,7 @@ if(NPROC EQUAL 0)
 endif()
 
 # --- stable paths ----------------------------------------------------------
-set(DIST_DIR      ${CMAKE_SOURCE_DIR}/dist           CACHE PATH "install prefix for nginx")
+set(SANDBOX_DIR   ${CMAKE_SOURCE_DIR}/sandbox        CACHE PATH "nginx install prefix = the runnable sandbox tree")
 set(ZLIBNG_PREFIX ${CMAKE_BINARY_DIR}/zlibng         CACHE PATH "static zlib-ng install prefix")
 
 # ============================================================================
@@ -60,7 +60,7 @@ set(OPENSSL_SRC_DIR ${SOURCE_DIR})
 
 # ============================================================================
 # 3. nginx + WAF module
-#    --prefix=${DIST_DIR} : no-root `make install` at a stable repo path
+#    --prefix=${SANDBOX_DIR} : no-root `make install` at a stable repo path
 #    -I/-L zlib-ng opts   : NOT --with-zlib (breaks on zlib-ng); the cc/ld
 #                           opts make the gzip probe + final link pick libz.a
 # ============================================================================
@@ -77,7 +77,7 @@ ExternalProject_Add(nginx_ext
   URL_HASH         SHA256=${NGINX_SHA256}
   BUILD_IN_SOURCE  TRUE
   CONFIGURE_COMMAND <SOURCE_DIR>/configure
-      --prefix=${DIST_DIR} --build=E
+      --prefix=${SANDBOX_DIR} --build=E
       --with-stream --with-stream_realip_module --with-stream_ssl_preread_module
       --with-pcre --with-pcre-jit --with-http_stub_status_module
       --with-threads --with-file-aio
@@ -90,8 +90,8 @@ ExternalProject_Add(nginx_ext
       --add-dynamic-module=${CMAKE_SOURCE_DIR}/modules/ngx_http_waf
   BUILD_COMMAND    sh -c "${_NGINX_BUILD_SH}"
   INSTALL_COMMAND  make install
-  BUILD_BYPRODUCTS ${DIST_DIR}/sbin/nginx
-                   ${DIST_DIR}/modules/ngx_http_waf_module.so)
+  BUILD_BYPRODUCTS ${SANDBOX_DIR}/sbin/nginx
+                   ${SANDBOX_DIR}/modules/ngx_http_waf_module.so)
 ExternalProject_Get_Property(nginx_ext SOURCE_DIR)
 set(NGINX_SRC_DIR ${SOURCE_DIR})
 
@@ -99,12 +99,12 @@ set(NGINX_SRC_DIR ${SOURCE_DIR})
 # Convenience target — fast WAF-module iteration
 #   cmake --build build --target waf_module
 # Re-runs only `make modules` in the already-built nginx tree and copies the
-# fresh .so into dist/. NOTE: a rebuilt .so needs a full nginx stop+start —
+# fresh .so into sandbox/. NOTE: a rebuilt .so needs a full nginx stop+start —
 # `nginx -s reload` does NOT reload module code.
 # ============================================================================
 add_custom_target(waf_module
   COMMAND sh -c "test -f ${_SSL_HEADER} && touch ${_SSL_HEADER}; make -C ${NGINX_SRC_DIR} modules"
   COMMAND ${CMAKE_COMMAND} -E copy
           ${NGINX_SRC_DIR}/objs/ngx_http_waf_module.so
-          ${DIST_DIR}/modules/ngx_http_waf_module.so
-  COMMENT "Rebuilding ngx_http_waf_module.so and copying into dist/modules/")
+          ${SANDBOX_DIR}/modules/ngx_http_waf_module.so
+  COMMENT "Rebuilding ngx_http_waf_module.so and copying into sandbox/modules/")

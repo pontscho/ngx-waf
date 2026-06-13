@@ -37,7 +37,6 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 .
 ├── CMakeLists.txt               super-build: fetch + build OpenSSL/zlib-ng/nginx
 ├── cmake/Versions.cmake         pinned PKG_* versions, URLs, SHA256 hashes
-├── dist/                        build output (nginx binary + module) — generated
 ├── modules/ngx_http_waf/        the dynamic module
 │   ├── config                   nginx addon build descriptor
 │   ├── scanners.list            scanner path patterns (hot-reloadable)
@@ -52,20 +51,22 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 ├── geodb/
 │   ├── location.db              IPFire libloc database (uncompressed)
 ├── reference/                   nanolibloc.c (basis), loctest.c (geo oracle)
-├── sandbox/                     runnable test environment
-│   ├── nginx.conf               full HTTP + mail example config
-│   ├── certs/                   self-signed test cert/key
-│   ├── html/                    test documents
-│   └── logs/
+├── sandbox/                     runnable test env AND the build install prefix
+│   ├── nginx.conf               full HTTP + mail example config   (tracked)
+│   ├── certs/                   self-signed test cert/key          (tracked)
+│   ├── html/                    test documents                     (tracked)
+│   ├── sbin/nginx               installed by the build             (generated)
+│   ├── modules/*.so             installed by the build             (generated)
+│   └── conf/ logs/ *_temp/      nginx runtime dirs                 (generated)
 ```
 
 
 ## Building
 
 The toolchain is a **CMake super-build**. From a clean checkout it downloads
-version-pinned sources (OpenSSL, zlib-ng, nginx), builds them, and produces
-the nginx binary + WAF module under `dist/` — no vendored trees, no manual
-`./configure` dance.
+version-pinned sources (OpenSSL, zlib-ng, nginx), builds them, and installs
+the nginx binary + WAF module into the runnable `sandbox/` tree — no vendored
+trees, no manual `./configure` dance.
 
 ### Prerequisites
 
@@ -91,10 +92,15 @@ cmake -B build -S .
 cmake --build build -j
 ```
 
-This produces, at stable repo-relative paths:
+This installs, into the `sandbox/` tree (the nginx prefix), at stable
+repo-relative paths:
 
-- `dist/sbin/nginx` — the binary (OpenSSL 3.5.7 + static zlib-ng)
-- `dist/modules/ngx_http_waf_module.so` — the WAF dynamic module
+- `sandbox/sbin/nginx` — the binary (OpenSSL 3.5.7 + static zlib-ng)
+- `sandbox/modules/ngx_http_waf_module.so` — the WAF dynamic module
+
+(`sandbox/` doubles as the build install prefix and the runnable test env;
+the generated `sbin/`, `modules/`, `conf/`, `logs/`, `*_temp/` are gitignored,
+while `nginx.conf`, `certs/`, and `html/` are tracked.)
 
 > **Note — clean-build stamp race.** On a *fresh* checkout the very long
 > in-tree OpenSSL compile can make the first `cmake --build` step report a
@@ -105,21 +111,21 @@ This produces, at stable repo-relative paths:
 ### Fast module iteration
 
 Day-to-day module edits should not re-run the whole chain. After the first
-full build, rebuild just the `.so` and refresh `dist/` with:
+full build, rebuild just the `.so` and refresh `sandbox/modules/` with:
 
 ```sh
 cmake --build build --target waf_module
 ```
 
 It runs `make modules` in the already-built nginx tree and copies the fresh
-`ngx_http_waf_module.so` into `dist/modules/`.
+`ngx_http_waf_module.so` into `sandbox/modules/`.
 
 ### Verifying the build
 
 ```sh
-dist/sbin/nginx -V                 # OpenSSL 3.5.7, --with-http_v3_module, --with-mail
-ldd dist/sbin/nginx                # no libz.so -> zlib-ng is static
-strings dist/sbin/nginx | grep -i zlib-ng
+sandbox/sbin/nginx -V                 # OpenSSL 3.5.7, --with-http_v3_module, --with-mail
+ldd sandbox/sbin/nginx                # no libz.so -> zlib-ng is static
+strings sandbox/sbin/nginx | grep -i zlib-ng
 ```
 
 ### ⚠️ Gotchas (read before you build)
@@ -154,7 +160,7 @@ strings dist/sbin/nginx | grep -i zlib-ng
 ### Loading the module
 
 ```nginx
-load_module /path/to/dist/modules/ngx_http_waf_module.so;
+load_module /path/to/sandbox/modules/ngx_http_waf_module.so;
 ```
 
 ### Directive reference
@@ -287,7 +293,7 @@ test nginx runs unprivileged; **production binds 25/587** (needs root or
 Minimal HTTP example:
 
 ```nginx
-load_module .../dist/modules/ngx_http_waf_module.so;
+load_module .../sandbox/modules/ngx_http_waf_module.so;
 
 http {
     waf               on;
