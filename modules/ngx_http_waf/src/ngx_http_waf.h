@@ -30,6 +30,28 @@ typedef enum {
 
 
 /*
+ * User-Agent classification outcome, exposed as the $waf_type variable.
+ *
+ * The list-backed categories form a contiguous prefix [0, WAF_UA_LIST_MAX):
+ * each indexes one config-file-driven regex slot in loc_conf.ua_re[] and is
+ * matched in this exact priority order (scanner first, bot last). REGULAR
+ * (nothing matched) and EMPTY (missing/empty UA) are result-only values that
+ * never index a regex slot. classify() always lands on exactly one value.
+ */
+typedef enum {
+    WAF_UA_SCANNER = 0,        /* security tools: sqlmap, nikto, ... (blocked) */
+    WAF_UA_AI_CRAWLER,         /* GPTBot, ClaudeBot, CCBot, Bytespider, ...     */
+    WAF_UA_CRAWLER,            /* Googlebot, bingbot, Baiduspider, ...          */
+    WAF_UA_BOT,                /* social / monitor / feed / HTTP libraries      */
+    WAF_UA_LIST_MAX,           /* == 4: number of ua_re[] regex slots           */
+
+    WAF_UA_REGULAR = WAF_UA_LIST_MAX, /* no signature matched (assume human)    */
+    WAF_UA_EMPTY,              /* missing / empty User-Agent (blocked)          */
+    WAF_UA_MAX
+} ngx_http_waf_ua_e;
+
+
+/*
  * Per-{http,server,location} configuration.
  *
  * The module carries no shared writable state: the geo database is
@@ -47,6 +69,9 @@ typedef struct {
 
     ngx_str_t                      scanner_list; /* waf_scanner_list path */
     ngx_regex_t                   *scanner_re[WAF_ACTION_MAX];
+
+    /* UA classification: one compiled alternation per list-backed category */
+    ngx_regex_t                   *ua_re[WAF_UA_LIST_MAX];
 
     ngx_str_t                      server_token; /* waf_server_token      */
 
@@ -71,10 +96,13 @@ typedef struct {
 typedef struct {
     unsigned          spoof_swap:1;   /* replace body with Apache error page */
     unsigned          spoof_done:1;   /* Apache body already emitted         */
+    unsigned          classified:1;   /* ua field already computed            */
     ngx_str_t         spoof_body;     /* synthesized Apache error page        */
 
     struct sockaddr  *client_sa;      /* canonical client addr (POST_READ)    */
     socklen_t         client_socklen;
+
+    ngx_http_waf_ua_e ua;             /* $waf_type outcome (valid iff classified) */
 } ngx_http_waf_ctx_t;
 
 

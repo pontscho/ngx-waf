@@ -1,5 +1,5 @@
 /*
- * ngx_http_waf_module - path scanner matching and bot heuristics
+ * ngx_http_waf_module - path scanner matching and User-Agent classification
  *
  * The scanner list is read at configuration time. Each non-empty,
  * non-comment line is:
@@ -22,32 +22,6 @@ static ngx_uint_t  waf_action_code[WAF_ACTION_MAX] = {
     NGX_HTTP_NOT_FOUND,    /* WAF_ACTION_404 */
     NGX_HTTP_FORBIDDEN,    /* WAF_ACTION_403 */
     NGX_HTTP_CLOSE         /* WAF_ACTION_444 */
-};
-
-
-/*
- * Known offensive scanner User-Agent signatures, lowercase. Matched
- * case-insensitively as substrings. Deliberately narrow: only tools whose
- * UA is unambiguously a scanner, never a legitimate client or crawler.
- */
-static ngx_str_t  waf_bot_sigs[] = {
-    ngx_string("sqlmap"),
-    ngx_string("nikto"),
-    ngx_string("nmap"),
-    ngx_string("masscan"),
-    ngx_string("zgrab"),
-    ngx_string("nuclei"),
-    ngx_string("dirbuster"),
-    ngx_string("gobuster"),
-    ngx_string("wpscan"),
-    ngx_string("acunetix"),
-    ngx_string("nessus"),
-    ngx_string("netsparker"),
-    ngx_string("fimap"),
-    ngx_string("hydra"),
-    ngx_string("arachni"),
-    ngx_string("dirsearch"),
-    ngx_null_string
 };
 
 
@@ -101,7 +75,7 @@ ngx_http_waf_read_file(ngx_conf_t *cf, ngx_str_t *path, ngx_str_t *out)
 
     if (n == NGX_FILE_ERROR || (size_t) n != size) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "failed to read scanner list \"%V\"", &full);
+                           "failed to read list file \"%V\"", &full);
         return NGX_ERROR;
     }
 
@@ -307,31 +281,106 @@ ngx_http_waf_scanner_lookup(ngx_http_waf_loc_conf_t *wlcf, ngx_str_t *uri)
 
 
 ngx_int_t
-ngx_http_waf_bot_match(ngx_http_request_t *r)
+ngx_http_waf_ua_list_compile(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *wlcf,
+    ngx_str_t *path, ngx_http_waf_ua_e cat)
 {
-    u_char       *last;
-    ngx_str_t     ua;
-    ngx_uint_t    i;
+    u_char       *p, *end, *ls, *le;
+    ngx_str_t     content, *tok;
+    ngx_uint_t    total;
+    ngx_array_t  *tokens;
+
+    if (ngx_http_waf_read_file(cf, path, &content) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    tokens = ngx_array_create(cf->temp_pool, 64, sizeof(ngx_str_t));
+    if (tokens == NULL) {
+        return NGX_ERROR;
+    }
+
+    total = 0;
+    p = content.data;
+    end = p + content.len;
+
+    while (p < end) {
+
+        ls = p;
+        while (p < end && *p != '\n') {
+            p++;
+        }
+        le = p;
+        if (p < end) {
+            p++;                       /* step over '\n' for next round */
+        }
+
+        if (le > ls && le[-1] == '\r') {
+            le--;
+        }
+
+        while (ls < le && (*ls == ' ' || *ls == '\t')) {
+            ls++;
+        }
+        while (le > ls && (le[-1] == ' ' || le[-1] == '\t')) {
+            le--;
+        }
+
+        if (ls == le || *ls == '#') {
+            continue;
+        }
+
+        /* the whole trimmed line is one PCRE2 fragment -- no action token */
+        tok = ngx_array_push(tokens);
+        if (tok == NULL) {
+            return NGX_ERROR;
+        }
+
+        tok->data = ls;
+        tok->len = le - ls;
+        total++;
+    }
+
+    if (ngx_http_waf_compile_bucket(cf, tokens, &wlcf->ua_re[cat]) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
+        "waf: loaded %ui UA pattern(s) from \"%V\"", total, path);
+
+    return NGX_OK;
+}
+
+
+void
+ngx_http_waf_ua_classify(ngx_http_request_t *r, ngx_http_waf_loc_conf_t *wlcf,
+    ngx_http_waf_ctx_t *ctx)
+{
+    ngx_str_t         ua;
+    ngx_uint_t        i;
     ngx_table_elt_t  *h;
+
+    ctx->classified = 1;
 
     h = r->headers_in.user_agent;
 
     if (h == NULL || h->value.len == 0) {
-        /* empty / missing User-Agent: replaces the old `if ($http_user_agent="")` */
-        return 1;
+        ctx->ua = WAF_UA_EMPTY;
+        return;
     }
 
     ua = h->value;
-    last = ua.data + ua.len;
 
-    for (i = 0; waf_bot_sigs[i].len; i++) {
-        if (ngx_strlcasestrn(ua.data, last, waf_bot_sigs[i].data,
-                             waf_bot_sigs[i].len - 1)
-            != NULL)
-        {
-            return 1;
+    /* priority order is the enum order: SCANNER, AI_CRAWLER, CRAWLER, BOT */
+    for (i = 0; i < WAF_UA_LIST_MAX; i++) {
+
+        if (wlcf->ua_re[i] == NULL) {
+            continue;
+        }
+
+        if (ngx_regex_exec(wlcf->ua_re[i], &ua, NULL, 0) >= 0) {
+            ctx->ua = (ngx_http_waf_ua_e) i;
+            return;
         }
     }
 
-    return 0;
+    ctx->ua = WAF_UA_REGULAR;
 }

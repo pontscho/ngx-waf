@@ -18,6 +18,21 @@
 #define NGX_HTTP_WAF_DEFAULT_TOKEN  "Apache/2.4.68 (Unix)"
 
 
+/*
+ * enum -> $waf_type string, indexed by ngx_http_waf_ua_e. The list-backed
+ * categories occupy [0, WAF_UA_LIST_MAX); REGULAR and EMPTY follow. A hit is
+ * returned by reference (static literal), never copied.
+ */
+static ngx_str_t  waf_type_str[WAF_UA_MAX] = {
+    ngx_string("scanner"),
+    ngx_string("ai-crawler"),
+    ngx_string("crawler"),
+    ngx_string("bot"),
+    ngx_string("regular"),
+    ngx_string("empty")
+};
+
+
 static ngx_int_t ngx_http_waf_postread_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_waf_preaccess_handler(ngx_http_request_t *r);
 
@@ -25,6 +40,8 @@ static void *ngx_http_waf_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_http_waf_set_scanner_list(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_waf_set_ua_list(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_waf_set_geo_db(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -42,7 +59,10 @@ static char *ngx_http_waf_set_mail_auth(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_waf_set_mail_backend(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static ngx_int_t ngx_http_waf_preconfiguration(ngx_conf_t *cf);
 static ngx_int_t ngx_http_waf_postconfiguration(ngx_conf_t *cf);
+static ngx_int_t ngx_http_waf_type_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
 
 static ngx_command_t  ngx_http_waf_commands[] = {
@@ -67,6 +87,35 @@ static ngx_command_t  ngx_http_waf_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
+
+    /* UA signature lists: one shared setter, category carried in cmd->post */
+    { ngx_string("waf_scanner_ua_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_waf_set_ua_list,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) WAF_UA_SCANNER },
+
+    { ngx_string("waf_ai_crawler_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_waf_set_ua_list,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) WAF_UA_AI_CRAWLER },
+
+    { ngx_string("waf_crawler_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_waf_set_ua_list,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) WAF_UA_CRAWLER },
+
+    { ngx_string("waf_bot_list"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_waf_set_ua_list,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      (void *) WAF_UA_BOT },
 
     { ngx_string("waf_server_token"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -136,7 +185,7 @@ static ngx_command_t  ngx_http_waf_commands[] = {
 
 
 static ngx_http_module_t  ngx_http_waf_module_ctx = {
-    NULL,                              /* preconfiguration */
+    ngx_http_waf_preconfiguration,     /* preconfiguration */
     ngx_http_waf_postconfiguration,    /* postconfiguration */
 
     NULL,                              /* create main configuration */
@@ -245,8 +294,15 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
-    sa = (ctx != NULL && ctx->client_sa != NULL)
-         ? ctx->client_sa : r->connection->sockaddr;
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_waf_module);
+    }
+
+    sa = (ctx->client_sa != NULL) ? ctx->client_sa : r->connection->sockaddr;
 
     rc = ngx_http_waf_reputation_check(wlcf, sa, &reason);
     if (rc != NGX_DECLINED) {
@@ -255,9 +311,19 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
         return rc;
     }
 
-    if (wlcf->bot_block && ngx_http_waf_bot_match(r)) {
+    /*
+     * Classify the UA into ctx->ua ($waf_type) unconditionally; blocking is
+     * a separate policy. With bot_block on, only the unambiguously-hostile
+     * outcomes (scanner tools, missing UA) are dropped -- crawler/ai-crawler/
+     * bot stay flag-only for the operator to act on via $waf_type.
+     */
+    ngx_http_waf_ua_classify(r, wlcf, ctx);
+
+    if (wlcf->bot_block
+        && (ctx->ua == WAF_UA_SCANNER || ctx->ua == WAF_UA_EMPTY))
+    {
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "waf: bot/scanner user-agent blocked");
+                      "waf: %V user-agent blocked", &waf_type_str[ctx->ua]);
         return NGX_HTTP_NOT_FOUND;
     }
 
@@ -312,6 +378,13 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         }
     }
 
+    /* same inherit-when-NULL for the UA classification regex slots */
+    for (i = 0; i < WAF_UA_LIST_MAX; i++) {
+        if (conf->ua_re[i] == NULL) {
+            conf->ua_re[i] = prev->ua_re[i];
+        }
+    }
+
     if (conf->scanner_list.data == NULL) {
         conf->scanner_list = prev->scanner_list;
     }
@@ -362,6 +435,32 @@ ngx_http_waf_set_scanner_list(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
 
     if (ngx_http_waf_scanner_compile(cf, wlcf, &value[1]) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * waf_{scanner_ua,ai_crawler,crawler,bot}_list <path>: load a UA signature
+ * list into one ua_re[] slot. The category is carried in cmd->post so the
+ * four directives share this single setter.
+ */
+static char *
+ngx_http_waf_set_ua_list(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_waf_loc_conf_t  *wlcf = conf;
+    ngx_str_t                *value = cf->args->elts;
+    ngx_http_waf_ua_e         cat;
+
+    cat = (ngx_http_waf_ua_e) (uintptr_t) cmd->post;
+
+    if (wlcf->ua_re[cat] != NULL) {
+        return "is duplicate";
+    }
+
+    if (ngx_http_waf_ua_list_compile(cf, wlcf, &value[1], cat) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
@@ -526,6 +625,64 @@ ngx_http_waf_set_mail_backend(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     wlcf->mail_backend_port = value[2];
 
     return NGX_CONF_OK;
+}
+
+
+/*
+ * $waf_type: the UA classification string (regular/crawler/ai-crawler/bot/
+ * scanner/empty). NOCACHEABLE so the get_handler runs on demand; works even
+ * where `waf off` skips the phase handlers (pure-classification use), by
+ * lazily allocating ctx and classifying once.
+ */
+static ngx_int_t
+ngx_http_waf_preconfiguration(ngx_conf_t *cf)
+{
+    ngx_str_t             name = ngx_string("waf_type");
+    ngx_http_variable_t  *var;
+
+    var = ngx_http_add_variable(cf, &name, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+
+    var->get_handler = ngx_http_waf_type_variable;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_type_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
+    uintptr_t data)
+{
+    ngx_str_t                *s;
+    ngx_http_waf_ctx_t       *ctx;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
+
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_waf_module);
+    }
+
+    if (!ctx->classified) {
+        wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+        ngx_http_waf_ua_classify(r, wlcf, ctx);
+    }
+
+    s = &waf_type_str[ctx->ua];
+
+    v->len = s->len;
+    v->data = s->data;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
 }
 
 

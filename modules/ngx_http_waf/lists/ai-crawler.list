@@ -1,0 +1,25 @@
+# ngx_http_waf_module - AI / LLM crawler User-Agent signatures
+#
+# $waf_type = ai-crawler. Flag-only: surfaced for the operator, never blocked
+# by waf_bot_block. Checked BEFORE crawler.list, so AI-specific variants
+# (e.g. Applebot-Extended, Google-Extended) win over their generic crawler
+# counterparts. One case-insensitive PCRE2 fragment per line.
+#
+# Sources: ai.robots.txt, Matomo bots.yml. Drifts fast -- reload to update.
+
+GPTBot
+OAI-SearchBot
+ChatGPT-User
+ClaudeBot
+anthropic-ai
+Claude-User
+CCBot
+Bytespider
+Google-Extended
+PerplexityBot
+Amazonbot
+meta-externalagent
+Applebot-Extended
+cohere-ai
+Diffbot
+YouBot
