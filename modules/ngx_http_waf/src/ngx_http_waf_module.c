@@ -14,9 +14,24 @@
 #include "waf_reputation.h"
 #include "waf_authhttp.h"
 #include "waf_status.h"
+#include "waf_ja4.h"
+
+#if (NGX_HTTP_SSL)
+#include <ngx_http_ssl_module.h>
+#endif
 
 
 #define NGX_HTTP_WAF_DEFAULT_TOKEN  "Apache/2.4.68 (Unix)"
+
+
+#if (NGX_HTTP_SSL)
+/*
+ * SSL ex-data index holding the per-connection JA4 string (an ngx_str_t* from
+ * the connection pool, set by the client_hello callback at handshake time).
+ * Allocated once in postconfiguration; -1 until then -> $waf_ja4_hash unset.
+ */
+static int  ngx_http_waf_ja4_ssl_index = -1;
+#endif
 
 
 /*
@@ -49,7 +64,24 @@ ngx_str_t  waf_reason_str[WAF_REASON_MAX] = {
     ngx_string("flag"),
     ngx_string("scanner_ua"),
     ngx_string("empty_ua"),
-    ngx_string("scanner_path")
+    ngx_string("scanner_path"),
+    ngx_string("asn"),
+    ngx_string("method")
+};
+
+
+/*
+ * `waf` / `waf_stream` directive mode. Three-state so a config can observe
+ * without blocking (detect). `on` is an alias for enforce (backward compat).
+ * Fail-CLOSED: detect is the ONLY non-blocking value (see
+ * ngx_http_waf_finalize_decision); any other value blocks.
+ */
+static ngx_conf_enum_t  ngx_http_waf_mode[] = {
+    { ngx_string("off"),     WAF_MODE_OFF     },
+    { ngx_string("detect"),  WAF_MODE_DETECT  },
+    { ngx_string("enforce"), WAF_MODE_ENFORCE },
+    { ngx_string("on"),      WAF_MODE_ENFORCE },
+    { ngx_null_string, 0 }
 };
 
 
@@ -66,6 +98,12 @@ static char *ngx_http_waf_set_ua_list(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_waf_set_geo_db(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_waf_set_geo_block(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_waf_set_asn_block(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_waf_set_method_allow(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_waf_set_method_deny(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_waf_set_geo_whitelist(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -100,16 +138,20 @@ static ngx_int_t ngx_http_waf_country_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_waf_reason_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_waf_asn_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_waf_ja4_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
 
 static ngx_command_t  ngx_http_waf_commands[] = {
 
     { ngx_string("waf"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_waf_loc_conf_t, enable),
-      NULL },
+      offsetof(ngx_http_waf_loc_conf_t, mode),
+      &ngx_http_waf_mode },
 
     { ngx_string("waf_bot_block"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
@@ -171,6 +213,27 @@ static ngx_command_t  ngx_http_waf_commands[] = {
     { ngx_string("waf_geo_block"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_waf_set_geo_block,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("waf_asn_block"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_waf_set_asn_block,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("waf_method_allow"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_waf_set_method_allow,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("waf_method_deny"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_waf_set_method_deny,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -285,7 +348,7 @@ ngx_http_waf_postread_handler(ngx_http_request_t *r)
 
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-    if (!wlcf->enable) {
+    if (wlcf->mode == WAF_MODE_OFF) {
         return NGX_DECLINED;
     }
 
@@ -397,6 +460,28 @@ ngx_http_waf_stat_stream_bump(void *shm, ngx_http_waf_reason_e reason,
 }
 
 
+/*
+ * Detect-mode STREAM counter: record what WOULD have been denied without
+ * actually denying it. Opaque-pointer entry for the stream head (which never
+ * sees ngx_http_waf_stat_shm_t); NULL zone is a no-op. Unlike
+ * ngx_http_waf_stat_stream_bump it does NOT touch the connection/allowed
+ * totals -- the detect path counts the connection as allowed separately.
+ */
+void
+ngx_http_waf_stat_stream_would_block(void *shm, ngx_http_waf_reason_e reason)
+{
+    ngx_http_waf_stat_shm_t  *sh = shm;
+
+    if (sh == NULL) {
+        return;
+    }
+
+    if ((ngx_uint_t) reason < WAF_REASON_MAX) {
+        (void) ngx_atomic_fetch_add(&sh->stream_would_block[reason], 1);
+    }
+}
+
+
 /* libloc flag bit -> flag_blocked[] slot (Tor has no bit; it is a CC verdict) */
 static const uint16_t  waf_flag_bits[WAF_FLAG_SLOTS] = {
     NGX_HTTP_WAF_GEO_FLAG_ANON_PROXY,
@@ -450,6 +535,102 @@ ngx_http_waf_stat_http_block(ngx_http_waf_stat_shm_t *sh, ngx_uint_t idx,
 
 
 /*
+ * Detect-aware block finalizer, the single chokepoint every HTTP block point
+ * funnels through. In WAF_MODE_DETECT the verdict is observed only: the
+ * global would_block[reason] counter is bumped, ctx->reason is set (so
+ * $waf_reason still renders the would-be verdict) and NGX_DECLINED is
+ * returned so the request proceeds. In every other (blocking) mode the
+ * standard block accounting runs (ngx_http_waf_stat_http_block) and block_code
+ * is returned. FAIL-CLOSED: detect is the ONLY non-blocking branch; any
+ * unexpected mode value blocks. sh / idx are re-resolved from r so callers
+ * need not thread them through.
+ */
+static ngx_int_t
+ngx_http_waf_finalize_decision(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_loc_conf_t *wlcf, ngx_http_waf_reason_e reason,
+    ngx_int_t block_code)
+{
+    ngx_uint_t                 idx;
+    ngx_http_waf_stat_shm_t   *sh;
+    ngx_http_waf_srv_conf_t   *wscf;
+    ngx_http_waf_main_conf_t  *wmcf;
+
+    wmcf = ngx_http_get_module_main_conf(r, ngx_http_waf_module);
+    wscf = ngx_http_get_module_srv_conf(r, ngx_http_waf_module);
+    sh = (wmcf->stat_zone != NULL) ? wmcf->stat_zone->data : NULL;
+    idx = (wscf->stat_index < wmcf->nvhosts) ? wscf->stat_index : 0;
+
+    if (wlcf->mode == WAF_MODE_DETECT) {
+        ctx->reason = reason;
+        ctx->verdict_set = 1;
+
+        if (sh != NULL) {
+            (void) ngx_atomic_fetch_add(&sh->http_would_block[reason], 1);
+        }
+
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "waf: would-block (%V) [detect]", &waf_reason_str[reason]);
+
+        return NGX_DECLINED;
+    }
+
+    ngx_http_waf_stat_http_block(sh, idx, ctx, reason, block_code);
+
+    return block_code;
+}
+
+
+/*
+ * Case-insensitive lookup of the request method name in a config list of
+ * non-standard method tokens (e.g. TRACK, DEBUG) that nginx does not parse
+ * into an NGX_HTTP_* bit. NULL list -> no match.
+ */
+static ngx_int_t
+ngx_http_waf_method_in_list(ngx_http_request_t *r, ngx_array_t *list)
+{
+    ngx_str_t   *names;
+    ngx_uint_t   i;
+
+    if (list == NULL) {
+        return 0;
+    }
+
+    names = list->elts;
+
+    for (i = 0; i < list->nelts; i++) {
+        if (r->method_name.len == names[i].len
+            && ngx_strncasecmp(r->method_name.data, names[i].data,
+                               names[i].len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/* The request method is on the whitelist (standard bit or non-standard name). */
+static ngx_int_t
+ngx_http_waf_method_allowed(ngx_http_waf_loc_conf_t *wlcf,
+    ngx_http_request_t *r)
+{
+    return (r->method & wlcf->allow_mask)
+           || ngx_http_waf_method_in_list(r, wlcf->allow_list);
+}
+
+
+/* The request method is on the blacklist (standard bit or non-standard name). */
+static ngx_int_t
+ngx_http_waf_method_denied(ngx_http_waf_loc_conf_t *wlcf,
+    ngx_http_request_t *r)
+{
+    return (r->method & wlcf->deny_mask)
+           || ngx_http_waf_method_in_list(r, wlcf->deny_list);
+}
+
+
+/*
  * PREACCESS phase. Order is cheap -> expensive: IP reputation
  * (blocklist/geo/flags) -> bot heuristics (string match) -> scanner regex.
  * Subrequests and internal redirects are never re-scanned.
@@ -476,7 +657,7 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
 
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-    if (!wlcf->enable) {
+    if (wlcf->mode == WAF_MODE_OFF) {
         return NGX_DECLINED;
     }
 
@@ -517,14 +698,20 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
         ctx->country[0] = verdict.country[0];
         ctx->country[1] = verdict.country[1];
         ctx->geo_done = 1;
+        ctx->asn = verdict.asn;
+        ctx->asn_done = 1;
     }
     cc16 = (uint16_t) ((verdict.country[0] << 8) | verdict.country[1]);
 
     if (rc != NGX_DECLINED) {
+        if (ngx_http_waf_finalize_decision(r, ctx, wlcf, verdict.reason, rc)
+            == NGX_DECLINED)
+        {
+            return NGX_DECLINED;   /* detect: would-block recorded, allow */
+        }
+
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "waf: reputation block (%V)", &reason);
-
-        ngx_http_waf_stat_http_block(sh, idx, ctx, verdict.reason, rc);
 
         /* per-flag breakdown only for a network-flag verdict */
         if (sh != NULL && verdict.reason == WAF_REASON_FLAG) {
@@ -544,6 +731,41 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
     }
 
     /*
+     * Method filter -- whitelist wins, then blacklist narrows. Both routed
+     * through the detect-aware finalizer, so detect mode records
+     * would_block[method] and lets the request through. A non-whitelisted or
+     * explicitly-denied method is hidden with a 404 (the policy is opaque to
+     * the client, like scanner blocks).
+     */
+    if (wlcf->method_allow_set && !ngx_http_waf_method_allowed(wlcf, r)) {
+        if (ngx_http_waf_finalize_decision(r, ctx, wlcf, WAF_REASON_METHOD,
+                                           NGX_HTTP_NOT_FOUND) == NGX_DECLINED)
+        {
+            return NGX_DECLINED;
+        }
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "waf: method \"%V\" not allowed", &r->method_name);
+        if (verdict.geo_valid) {
+            ngx_http_waf_stat_cc_bump(sh, cc16, 1);
+        }
+        return NGX_HTTP_NOT_FOUND;
+    }
+
+    if (wlcf->method_deny_set && ngx_http_waf_method_denied(wlcf, r)) {
+        if (ngx_http_waf_finalize_decision(r, ctx, wlcf, WAF_REASON_METHOD,
+                                           NGX_HTTP_NOT_FOUND) == NGX_DECLINED)
+        {
+            return NGX_DECLINED;
+        }
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "waf: method \"%V\" denied", &r->method_name);
+        if (verdict.geo_valid) {
+            ngx_http_waf_stat_cc_bump(sh, cc16, 1);
+        }
+        return NGX_HTTP_NOT_FOUND;
+    }
+
+    /*
      * Classify the UA into ctx->ua ($waf_type) unconditionally; blocking is
      * a separate policy. With bot_block on, only the unambiguously-hostile
      * outcomes (scanner tools, missing UA) are dropped -- crawler/ai-crawler/
@@ -559,13 +781,16 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
     if (wlcf->bot_block
         && (ctx->ua == WAF_UA_SCANNER || ctx->ua == WAF_UA_EMPTY))
     {
+        if (ngx_http_waf_finalize_decision(r, ctx, wlcf,
+                (ctx->ua == WAF_UA_SCANNER) ? WAF_REASON_SCANNER_UA
+                                            : WAF_REASON_EMPTY_UA,
+                NGX_HTTP_NOT_FOUND) == NGX_DECLINED)
+        {
+            return NGX_DECLINED;   /* detect: would-block recorded, allow */
+        }
+
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "waf: %V user-agent blocked", &waf_type_str[ctx->ua]);
-
-        ngx_http_waf_stat_http_block(sh, idx, ctx,
-            (ctx->ua == WAF_UA_SCANNER) ? WAF_REASON_SCANNER_UA
-                                        : WAF_REASON_EMPTY_UA,
-            NGX_HTTP_NOT_FOUND);
 
         if (verdict.geo_valid) {
             ngx_http_waf_stat_cc_bump(sh, cc16, 1);
@@ -576,10 +801,14 @@ ngx_http_waf_preaccess_handler(ngx_http_request_t *r)
 
     rc = ngx_http_waf_scanner_lookup(wlcf, &r->uri);
     if (rc != NGX_DECLINED) {
+        if (ngx_http_waf_finalize_decision(r, ctx, wlcf, WAF_REASON_SCANNER_PATH,
+                                           rc) == NGX_DECLINED)
+        {
+            return NGX_DECLINED;   /* detect: would-block recorded, allow */
+        }
+
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                       "waf: scanner path \"%V\" blocked (%i)", &r->uri, rc);
-
-        ngx_http_waf_stat_http_block(sh, idx, ctx, WAF_REASON_SCANNER_PATH, rc);
 
         if (sh != NULL) {
             switch (rc) {
@@ -646,7 +875,7 @@ ngx_http_waf_create_loc_conf(ngx_conf_t *cf)
      * explicit "unset" sentinel use NGX_CONF_UNSET so merge can tell
      * inherited from default.
      */
-    conf->enable = NGX_CONF_UNSET;
+    conf->mode = NGX_CONF_UNSET_UINT;
     conf->bot_block = NGX_CONF_UNSET;
 
     return conf;
@@ -660,7 +889,8 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_waf_loc_conf_t  *conf = child;
     ngx_uint_t                i;
 
-    ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    /* fail-CLOSED default: an unset waf gate enforces (never silently off) */
+    ngx_conf_merge_uint_value(conf->mode, prev->mode, WAF_MODE_ENFORCE);
     ngx_conf_merge_value(conf->bot_block, prev->bot_block, 0);
 
     /* inherit the compiled buckets when this level defined no list */
@@ -691,6 +921,9 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->rep.block_cc == NULL) {
         conf->rep.block_cc = prev->rep.block_cc;
     }
+    if (conf->rep.block_asn == NULL) {
+        conf->rep.block_asn = prev->rep.block_asn;
+    }
     if (conf->rep.allow_cc == NULL) {
         conf->rep.allow_cc = prev->rep.allow_cc;
     }
@@ -712,6 +945,18 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     if (conf->trusted_proxy == NULL) {
         conf->trusted_proxy = prev->trusted_proxy;
+    }
+
+    /* method filter: inherit each list independently when unset at this level */
+    if (!conf->method_allow_set) {
+        conf->method_allow_set = prev->method_allow_set;
+        conf->allow_mask = prev->allow_mask;
+        conf->allow_list = prev->allow_list;
+    }
+    if (!conf->method_deny_set) {
+        conf->method_deny_set = prev->method_deny_set;
+        conf->deny_mask = prev->deny_mask;
+        conf->deny_list = prev->deny_list;
     }
 
     /* backend MTA is set as a pair; inherit together when unset here */
@@ -838,6 +1083,140 @@ ngx_http_waf_set_geo_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+/*
+ * waf_asn_block <ASN>...: deny any client whose source IP resolves (via the
+ * geo database) to one of the listed autonomous systems. Decimal ASNs only;
+ * asn==0 (no record) is never matched.
+ */
+static char *
+ngx_http_waf_set_asn_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_waf_loc_conf_t  *wlcf = conf;
+    ngx_str_t                *value;
+    ngx_uint_t                i;
+
+    value = cf->args->elts;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_http_waf_asn_add(cf, &wlcf->rep.block_asn, &value[i]) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * Standard HTTP method name -> NGX_HTTP_* request-method bit. Names not in
+ * this table (TRACK, DEBUG, ...) are kept verbatim in a string list and
+ * matched against r->method_name at runtime.
+ */
+static const struct {
+    ngx_str_t   name;
+    ngx_uint_t  bit;
+} ngx_http_waf_method_bits[] = {
+    { ngx_string("GET"),       NGX_HTTP_GET       },
+    { ngx_string("HEAD"),      NGX_HTTP_HEAD      },
+    { ngx_string("POST"),      NGX_HTTP_POST      },
+    { ngx_string("PUT"),       NGX_HTTP_PUT       },
+    { ngx_string("DELETE"),    NGX_HTTP_DELETE    },
+    { ngx_string("MKCOL"),     NGX_HTTP_MKCOL     },
+    { ngx_string("COPY"),      NGX_HTTP_COPY      },
+    { ngx_string("MOVE"),      NGX_HTTP_MOVE      },
+    { ngx_string("OPTIONS"),   NGX_HTTP_OPTIONS   },
+    { ngx_string("PROPFIND"),  NGX_HTTP_PROPFIND  },
+    { ngx_string("PROPPATCH"), NGX_HTTP_PROPPATCH },
+    { ngx_string("LOCK"),      NGX_HTTP_LOCK      },
+    { ngx_string("UNLOCK"),    NGX_HTTP_UNLOCK    },
+    { ngx_string("PATCH"),     NGX_HTTP_PATCH     },
+    { ngx_string("TRACE"),     NGX_HTTP_TRACE     },
+    { ngx_null_string, 0 }
+};
+
+
+/*
+ * Shared worker for waf_method_allow / waf_method_deny: map each argument to
+ * its NGX_HTTP_* bit (OR-ed into *mask), or -- for a non-standard method name
+ * -- append the verbatim token to *list (created on first use).
+ */
+static char *
+ngx_http_waf_method_list_add(ngx_conf_t *cf, ngx_uint_t *mask,
+    ngx_array_t **list)
+{
+    ngx_str_t   *value = cf->args->elts;
+    ngx_str_t   *s;
+    ngx_uint_t   i, j;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        for (j = 0; ngx_http_waf_method_bits[j].name.len; j++) {
+            if (value[i].len == ngx_http_waf_method_bits[j].name.len
+                && ngx_strncasecmp(value[i].data,
+                                   ngx_http_waf_method_bits[j].name.data,
+                                   value[i].len) == 0)
+            {
+                *mask |= ngx_http_waf_method_bits[j].bit;
+                break;
+            }
+        }
+
+        if (ngx_http_waf_method_bits[j].name.len != 0) {
+            continue;   /* matched a standard method bit */
+        }
+
+        /* non-standard method name -> verbatim string list */
+        if (*list == NULL) {
+            *list = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+            if (*list == NULL) {
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        s = ngx_array_push(*list);
+        if (s == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        *s = value[i];
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * waf_method_allow <METHOD>...: only the listed methods pass; everything else
+ * is hidden (404). Whitelist; wins over waf_method_deny.
+ */
+static char *
+ngx_http_waf_set_method_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_waf_loc_conf_t  *wlcf = conf;
+
+    wlcf->method_allow_set = 1;
+
+    return ngx_http_waf_method_list_add(cf, &wlcf->allow_mask,
+                                        &wlcf->allow_list);
+}
+
+
+/*
+ * waf_method_deny <METHOD>...: the listed methods are hidden (404); everything
+ * else passes. Blacklist; narrows after the whitelist.
+ */
+static char *
+ngx_http_waf_set_method_deny(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_waf_loc_conf_t  *wlcf = conf;
+
+    wlcf->method_deny_set = 1;
+
+    return ngx_http_waf_method_list_add(cf, &wlcf->deny_mask,
+                                        &wlcf->deny_list);
 }
 
 
@@ -1018,6 +1397,8 @@ ngx_http_waf_preconfiguration(ngx_conf_t *cf)
     ngx_str_t             type_name = ngx_string("waf_type");
     ngx_str_t             country_name = ngx_string("waf_country");
     ngx_str_t             reason_name = ngx_string("waf_reason");
+    ngx_str_t             asn_name = ngx_string("waf_asn");
+    ngx_str_t             ja4_name = ngx_string("waf_ja4_hash");
     ngx_http_variable_t  *var;
 
     var = ngx_http_add_variable(cf, &type_name, NGX_HTTP_VAR_NOCACHEABLE);
@@ -1037,6 +1418,18 @@ ngx_http_waf_preconfiguration(ngx_conf_t *cf)
         return NGX_ERROR;
     }
     var->get_handler = ngx_http_waf_reason_variable;
+
+    var = ngx_http_add_variable(cf, &asn_name, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+    var->get_handler = ngx_http_waf_asn_variable;
+
+    var = ngx_http_add_variable(cf, &ja4_name, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+    var->get_handler = ngx_http_waf_ja4_variable;
 
     return NGX_OK;
 }
@@ -1167,6 +1560,108 @@ ngx_http_waf_reason_variable(ngx_http_request_t *r,
     v->no_cacheable = 1;
     v->not_found = 0;
 
+    return NGX_OK;
+}
+
+
+/*
+ * $waf_asn: the autonomous-system number of the request client (decimal), or
+ * not_found when no geo record exists / geo is not configured / asn==0. Reuses
+ * the ctx asn cache (filled by the preaccess reputation check) so no extra geo
+ * lookup happens on the hot path; falls back to its own lookup on paths where
+ * preaccess did not run (e.g. `waf off`).
+ */
+static ngx_int_t
+ngx_http_waf_asn_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char                     *p;
+    struct sockaddr            *sa;
+    ngx_http_waf_ctx_t         *ctx;
+    ngx_http_waf_loc_conf_t    *wlcf;
+    ngx_http_waf_geo_result_t   res;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_ctx_t));
+        if (ctx == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_http_set_ctx(r, ctx, ngx_http_waf_module);
+    }
+
+    if (!ctx->asn_done) {
+        wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+
+        if (wlcf->rep.geo_db != NULL) {
+            sa = (ctx->client_sa != NULL) ? ctx->client_sa
+                                          : r->connection->sockaddr;
+            ngx_http_waf_geo_lookup(wlcf->rep.geo_db, sa, &res);
+
+            if (res.found) {
+                ctx->asn = res.asn;
+            }
+        }
+
+        ctx->asn_done = 1;
+    }
+
+    /* asn==0: no record (or geo disabled) -> the variable is unset */
+    if (ctx->asn == 0) {
+        v->valid = 0;
+        v->no_cacheable = 1;
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    p = ngx_pnalloc(r->pool, NGX_INT32_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->len = ngx_sprintf(p, "%uD", ctx->asn) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+
+    return NGX_OK;
+}
+
+
+/*
+ * $waf_ja4_hash: the JA4 TLS fingerprint computed by the client_hello callback
+ * at handshake and stashed on the SSL connection (ex-data). NOT recomputed
+ * here -- the raw ClientHello is long gone by request time. not_found on plain
+ * HTTP, when no JA4 was stored, or before the ex-index is allocated.
+ */
+static ngx_int_t
+ngx_http_waf_ja4_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+#if (NGX_HTTP_SSL)
+    ngx_str_t       *j;
+    ngx_ssl_conn_t  *ssl_conn;
+
+    if (ngx_http_waf_ja4_ssl_index >= 0
+        && r->connection->ssl != NULL
+        && (ssl_conn = r->connection->ssl->connection) != NULL)
+    {
+        j = SSL_get_ex_data(ssl_conn, ngx_http_waf_ja4_ssl_index);
+        if (j != NULL && j->len != 0) {
+            v->len = j->len;
+            v->data = j->data;
+            v->valid = 1;
+            v->no_cacheable = 1;
+            v->not_found = 0;
+            return NGX_OK;
+        }
+    }
+#endif
+
+    v->valid = 0;
+    v->no_cacheable = 1;
+    v->not_found = 1;
     return NGX_OK;
 }
 
@@ -1330,6 +1825,99 @@ ngx_http_waf_stat_assign_vhosts(ngx_conf_t *cf)
 }
 
 
+#if (NGX_HTTP_SSL) && defined(SSL_CLIENT_HELLO_SUCCESS)
+
+/*
+ * client_hello callback (wrapper-chain, partner-selected Option 5). Compute the
+ * JA4 off the raw ClientHello and stash it on the SSL connection, then chain to
+ * nginx's own ngx_ssl_client_hello_callback so SNI cert selection runs
+ * unchanged. Covers TCP-TLS and QUIC from this one hook.
+ *
+ * NULL-guard (inspector C2): nginx's callback unconditionally dereferences the
+ * arg it fetches from SSL_CTX ex-data; if that arg was never set on this CTX,
+ * chaining would crash. So we chain only when the arg is present, otherwise we
+ * return SUCCESS and let the handshake proceed. JA4 failure is always non-fatal.
+ */
+static int
+ngx_http_waf_ja4_client_hello_cb(ngx_ssl_conn_t *ssl_conn, int *ad, void *arg)
+{
+    ngx_str_t         *ja4;
+    ngx_connection_t  *c;
+
+    c = ngx_ssl_get_connection(ssl_conn);
+
+    if (c != NULL && ngx_http_waf_ja4_ssl_index >= 0) {
+        ja4 = ngx_palloc(c->pool, sizeof(ngx_str_t));
+        if (ja4 != NULL
+            && ngx_http_waf_ja4_compute(ssl_conn, c->pool, ja4) == NGX_OK)
+        {
+            (void) SSL_set_ex_data(ssl_conn, ngx_http_waf_ja4_ssl_index, ja4);
+        }
+    }
+
+    if (SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
+                            ngx_ssl_client_hello_arg_index)
+        == NULL)
+    {
+        return SSL_CLIENT_HELLO_SUCCESS;
+    }
+
+    return ngx_ssl_client_hello_callback(ssl_conn, ad, NULL);
+}
+
+
+/*
+ * Allocate the JA4 SSL ex-data index (once) and install the wrapper callback on
+ * every server SSL_CTX that nginx has already armed with its own client_hello
+ * arg. Runs in postconfiguration, AFTER ngx_http_ssl_module's merge created the
+ * contexts and set the arg ex-data, so the wrapper always has a valid chain
+ * target. Contexts with no arg (no ssl{} on that server) are left untouched.
+ */
+static ngx_int_t
+ngx_http_waf_ja4_init(ngx_conf_t *cf)
+{
+    ngx_uint_t                   i;
+    SSL_CTX                     *ctx;
+    ngx_http_ssl_srv_conf_t     *sscf;
+    ngx_http_core_srv_conf_t   **cscfp;
+    ngx_http_core_main_conf_t   *cmcf;
+
+    if (ngx_http_waf_ja4_ssl_index < 0) {
+        ngx_http_waf_ja4_ssl_index =
+            SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+        if (ngx_http_waf_ja4_ssl_index < 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: cannot allocate JA4 SSL ex-data index");
+            return NGX_ERROR;
+        }
+    }
+
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    cscfp = cmcf->servers.elts;
+
+    for (i = 0; i < cmcf->servers.nelts; i++) {
+        sscf = cscfp[i]->ctx->srv_conf[ngx_http_ssl_module.ctx_index];
+
+        if (sscf == NULL || sscf->ssl.ctx == NULL) {
+            continue;
+        }
+
+        ctx = sscf->ssl.ctx;
+
+        if (SSL_CTX_get_ex_data(ctx, ngx_ssl_client_hello_arg_index) == NULL) {
+            continue;   /* nginx armed no client_hello arg here -> do not hook */
+        }
+
+        SSL_CTX_set_client_hello_cb(ctx, ngx_http_waf_ja4_client_hello_cb,
+                                    NULL);
+    }
+
+    return NGX_OK;
+}
+
+#endif /* NGX_HTTP_SSL && SSL_CLIENT_HELLO_SUCCESS */
+
+
 static ngx_int_t
 ngx_http_waf_postconfiguration(ngx_conf_t *cf)
 {
@@ -1366,6 +1954,14 @@ ngx_http_waf_postconfiguration(ngx_conf_t *cf)
     if (ngx_http_waf_stat_add_zone(cf) != NGX_OK) {
         return NGX_ERROR;
     }
+
+#if (NGX_HTTP_SSL) && defined(SSL_CLIENT_HELLO_SUCCESS)
+    /* install the JA4 client_hello wrapper on every server SSL_CTX (runs after
+     * the ssl module's merge has created the contexts + armed its own arg) */
+    if (ngx_http_waf_ja4_init(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
+#endif
 
     return NGX_OK;
 }

@@ -16,6 +16,7 @@ ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
     struct sockaddr *sa, ngx_str_t *reason, ngx_http_waf_verdict_t *out)
 {
     uint16_t                    cc16, *codes;
+    uint32_t                   *asns;
     ngx_uint_t                  i;
     ngx_http_waf_geo_result_t   res;
 
@@ -31,6 +32,7 @@ ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
         out->country[0] = 0;
         out->country[1] = 0;
         out->flags = 0;
+        out->asn = 0;
         out->geo_valid = 0;
     }
 
@@ -78,6 +80,7 @@ ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
             out->country[0] = res.country[0];
             out->country[1] = res.country[1];
             out->flags = res.flags;
+            out->asn = res.asn;
         }
     }
 
@@ -104,6 +107,25 @@ ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
             out->reason = WAF_REASON_FLAG;
         }
         return NGX_HTTP_FORBIDDEN;
+    }
+
+    /*
+     * ASN block: an explicit deny list of autonomous systems, applied in
+     * both block and whitelist modes (like the network-flag block above).
+     * asn==0 (unknown / no record) fails open.
+     */
+    if (rep->block_asn && res.asn != 0) {
+        asns = rep->block_asn->elts;
+
+        for (i = 0; i < rep->block_asn->nelts; i++) {
+            if (asns[i] == res.asn) {
+                ngx_str_set(reason, "asn");
+                if (out != NULL) {
+                    out->reason = WAF_REASON_ASN;
+                }
+                return NGX_HTTP_FORBIDDEN;
+            }
+        }
     }
 
     cc16 = (uint16_t) ((res.country[0] << 8) | res.country[1]);
@@ -210,6 +232,40 @@ ngx_http_waf_country_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *cc)
     c1 = ngx_toupper(cc->data[1]);
 
     *code = (uint16_t) ((c0 << 8) | c1);
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_http_waf_asn_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *val)
+{
+    ngx_int_t   n;
+    uint32_t   *asn;
+
+    n = ngx_atoi(val->data, val->len);
+
+    /* 4-byte ASN range 1..4294967295; 0 is reserved and fails open anyway */
+    if (n == NGX_ERROR || n <= 0 || (uint64_t) n > 0xffffffffULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_asn_block value \"%V\" is not a valid ASN "
+                           "(expected a decimal number 1..4294967295)", val);
+        return NGX_ERROR;
+    }
+
+    if (*arr == NULL) {
+        *arr = ngx_array_create(cf->pool, 8, sizeof(uint32_t));
+        if (*arr == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    asn = ngx_array_push(*arr);
+    if (asn == NULL) {
+        return NGX_ERROR;
+    }
+
+    *asn = (uint32_t) n;
 
     return NGX_OK;
 }

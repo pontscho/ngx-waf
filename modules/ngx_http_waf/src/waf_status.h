@@ -76,6 +76,7 @@ typedef struct {
     ngx_atomic_t  http_allowed;
     ngx_atomic_t  http_allowlist_hits;
     ngx_atomic_t  http_blocked[WAF_REASON_MAX];
+    ngx_atomic_t  http_would_block[WAF_REASON_MAX];  /* detect-mode: would block */
     ngx_atomic_t  http_scanner_path[WAF_ACTION_MAX]; /* 404 / 403 / 444     */
     ngx_atomic_t  http_resp_403;
     ngx_atomic_t  http_resp_404;
@@ -87,6 +88,7 @@ typedef struct {
     ngx_atomic_t  stream_connections_total;
     ngx_atomic_t  stream_allowed;
     ngx_atomic_t  stream_denied[WAF_REASON_MAX];
+    ngx_atomic_t  stream_would_block[WAF_REASON_MAX]; /* detect-mode: would deny */
 
     /* per-country open-addressed table (shared by HTTP + STREAM) */
     ngx_atomic_t            cc_overflow;          /* table-full drops       */

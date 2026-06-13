@@ -129,8 +129,9 @@ ngx_http_waf_status_bufsize(ngx_uint_t nvhosts,
     size_t      size, per_vhost_fixed, name_part;
     ngx_uint_t  i;
 
-    /* fixed section: health + all global/reason/ua/flag/scanner/resp lines */
-    size = 64 * WAF_STAT_LINE;
+    /* fixed section: health + all global/reason/would_block/ua/flag/scanner/
+     * resp lines (two extra WAF_REASON_MAX loops for would_block headroom) */
+    size = 96 * WAF_STAT_LINE;
 
     /* per-country: up to two metric lines per slot */
     if (WAF_STAT_CC_SLOTS > (NGX_MAX_SIZE_T_VALUE / (2 * WAF_STAT_LINE))) {
@@ -205,6 +206,12 @@ ngx_http_waf_status_plain(u_char *p, u_char *last,
                          (ngx_atomic_uint_t) snap->http_blocked[i]);
     }
 
+    for (i = WAF_REASON_NONE + 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p, "http_would_block_%V %uA\n",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->http_would_block[i]);
+    }
+
     p = ngx_snprintf(p, last - p,
                      "http_resp_403 %uA\n"
                      "http_resp_404 %uA\n"
@@ -241,6 +248,12 @@ ngx_http_waf_status_plain(u_char *p, u_char *last,
         p = ngx_snprintf(p, last - p, "stream_denied_%V %uA\n",
                          &waf_reason_str[i],
                          (ngx_atomic_uint_t) snap->stream_denied[i]);
+    }
+
+    for (i = WAF_REASON_NONE + 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p, "stream_would_block_%V %uA\n",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->stream_would_block[i]);
     }
 
     p = ngx_snprintf(p, last - p, "cc_overflow %uA\n",
@@ -348,6 +361,15 @@ ngx_http_waf_status_json(u_char *p, u_char *last,
         first = 0;
     }
 
+    p = ngx_snprintf(p, last - p, "},\"would_block\":{");
+
+    for (i = WAF_REASON_NONE + 1, first = 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p, "%s\"%V\":%uA", first ? "" : ",",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->http_would_block[i]);
+        first = 0;
+    }
+
     p = ngx_snprintf(p, last - p,
                      "},\"responses\":{\"403\":%uA,\"404\":%uA,\"444\":%uA},"
                      "\"scanner_path\":{\"404\":%uA,\"403\":%uA,\"444\":%uA},"
@@ -383,6 +405,15 @@ ngx_http_waf_status_json(u_char *p, u_char *last,
         p = ngx_snprintf(p, last - p, "%s\"%V\":%uA", first ? "" : ",",
                          &waf_reason_str[i],
                          (ngx_atomic_uint_t) snap->stream_denied[i]);
+        first = 0;
+    }
+
+    p = ngx_snprintf(p, last - p, "},\"would_block\":{");
+
+    for (i = WAF_REASON_NONE + 1, first = 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p, "%s\"%V\":%uA", first ? "" : ",",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->stream_would_block[i]);
         first = 0;
     }
 
@@ -476,6 +507,13 @@ ngx_http_waf_status_prometheus(u_char *p, u_char *last,
                          (ngx_atomic_uint_t) snap->http_blocked[i]);
     }
 
+    for (i = WAF_REASON_NONE + 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p,
+                         "waf_http_would_block_total{reason=\"%V\"} %uA\n",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->http_would_block[i]);
+    }
+
     for (i = 0; i < WAF_FLAG_SLOTS; i++) {
         p = ngx_snprintf(p, last - p,
             "waf_http_blocked_total{reason=\"flag\",flag=\"%s\"} %uA\n",
@@ -508,6 +546,13 @@ ngx_http_waf_status_prometheus(u_char *p, u_char *last,
                          "waf_stream_denied_total{reason=\"%V\"} %uA\n",
                          &waf_reason_str[i],
                          (ngx_atomic_uint_t) snap->stream_denied[i]);
+    }
+
+    for (i = WAF_REASON_NONE + 1; i < WAF_REASON_MAX; i++) {
+        p = ngx_snprintf(p, last - p,
+                         "waf_stream_would_block_total{reason=\"%V\"} %uA\n",
+                         &waf_reason_str[i],
+                         (ngx_atomic_uint_t) snap->stream_would_block[i]);
     }
 
     p = ngx_snprintf(p, last - p, "waf_cc_overflow_total %uA\n",

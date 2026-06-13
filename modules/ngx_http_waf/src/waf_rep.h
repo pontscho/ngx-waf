@@ -27,6 +27,7 @@ typedef struct {
     struct ngx_http_waf_geo_db_s  *geo_db;     /* waf_geo_db               */
     ngx_array_t                   *block_cc;   /* uint16 packed CC, block  */
     ngx_array_t                   *allow_cc;   /* uint16 packed CC, allow  */
+    ngx_array_t                   *block_asn;  /* uint32 ASN, block        */
     uint16_t                       flag_mask;  /* libloc flags to block    */
     ngx_array_t                   *blocklist;  /* ngx_cidr_t -> deny       */
     ngx_array_t                   *allowlist;  /* ngx_cidr_t -> allow      */
@@ -50,8 +51,21 @@ typedef enum {
     WAF_REASON_SCANNER_UA,     /* scanner / hostile UA (404)        */
     WAF_REASON_EMPTY_UA,       /* missing / empty UA (404)          */
     WAF_REASON_SCANNER_PATH,   /* scanner path regex (404/403/444)  */
+    WAF_REASON_ASN,            /* ASN block (403)                   */
+    WAF_REASON_METHOD,         /* HTTP method filter (404)          */
     WAF_REASON_MAX
 } ngx_http_waf_reason_e;
+
+
+/*
+ * WAF gate mode (the `waf` / `waf_stream` directive). Three-state enum so a
+ * config can observe-only (detect) without blocking. `on` is an alias for
+ * enforce (backward compatibility). Fail-CLOSED invariant: detect is the ONLY
+ * non-blocking value; any other value takes the blocking path.
+ */
+#define WAF_MODE_OFF      0
+#define WAF_MODE_DETECT   1
+#define WAF_MODE_ENFORCE  2
 
 
 /*
@@ -65,6 +79,7 @@ typedef struct {
     ngx_http_waf_reason_e  reason;      /* set on every return path           */
     u_char                 country[2];  /* copied from res.country; {0,0}=none */
     uint16_t               flags;       /* copied from res.flags              */
+    uint32_t               asn;         /* copied from res.asn; 0=unknown     */
     unsigned               geo_valid:1; /* a geo lookup actually ran          */
 } ngx_http_waf_verdict_t;
 
@@ -91,6 +106,10 @@ ngx_int_t ngx_http_waf_cidr_add(ngx_conf_t *cf, ngx_array_t **arr,
 /* Append an ISO-3166 alpha-2 country code (packed uint16) to *arr. */
 ngx_int_t ngx_http_waf_country_add(ngx_conf_t *cf, ngx_array_t **arr,
     ngx_str_t *cc);
+
+/* Append a decimal autonomous-system number (uint32) to *arr. */
+ngx_int_t ngx_http_waf_asn_add(ngx_conf_t *cf, ngx_array_t **arr,
+    ngx_str_t *val);
 
 /* Map a flag name (anonymous-proxy/satellite/anycast/drop/tor) into *rep. */
 ngx_int_t ngx_http_waf_flag_add(ngx_conf_t *cf, ngx_waf_rep_conf_t *rep,
@@ -119,6 +138,14 @@ struct ngx_http_waf_geo_db_s *ngx_http_waf_geo_open(ngx_conf_t *cf,
 void ngx_http_waf_stat_cc_bump(void *shm, uint16_t cc16, ngx_uint_t blocked);
 void ngx_http_waf_stat_stream_bump(void *shm, ngx_http_waf_reason_e reason,
     ngx_uint_t denied);
+
+/*
+ * STREAM-safe detect-mode counter: bump stream_would_block[reason] in the shm
+ * zone without the stream TU seeing ngx_http_waf_stat_shm_t. Mirrors
+ * ngx_http_waf_stat_stream_bump; defined in the HTTP unit. NULL shm is a no-op.
+ */
+void ngx_http_waf_stat_stream_would_block(void *shm,
+    ngx_http_waf_reason_e reason);
 
 
 #endif /* _WAF_REP_H_INCLUDED_ */

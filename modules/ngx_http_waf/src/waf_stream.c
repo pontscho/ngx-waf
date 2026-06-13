@@ -38,9 +38,19 @@ static ngx_shm_zone_t  *ngx_stream_waf_stat_zone;
 
 
 typedef struct {
-    ngx_flag_t          enable;     /* waf_stream on|off */
+    ngx_uint_t          mode;       /* waf_stream off|detect|enforce|on */
     ngx_waf_rep_conf_t  rep;        /* geo / CC / flags / CIDRs */
 } ngx_stream_waf_srv_conf_t;
+
+
+/* waf_stream mode enum (mirrors ngx_http_waf_mode); `on` aliases enforce */
+static ngx_conf_enum_t  ngx_stream_waf_mode[] = {
+    { ngx_string("off"),     WAF_MODE_OFF     },
+    { ngx_string("detect"),  WAF_MODE_DETECT  },
+    { ngx_string("enforce"), WAF_MODE_ENFORCE },
+    { ngx_string("on"),      WAF_MODE_ENFORCE },
+    { ngx_null_string, 0 }
+};
 
 
 static ngx_int_t ngx_stream_waf_handler(ngx_stream_session_t *s);
@@ -53,6 +63,8 @@ static ngx_int_t ngx_stream_waf_init(ngx_conf_t *cf);
 static char *ngx_stream_waf_set_geo_db(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_waf_set_geo_block(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_stream_waf_set_asn_block(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_waf_set_geo_whitelist(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
@@ -67,11 +79,11 @@ static char *ngx_stream_waf_set_allowlist(ngx_conf_t *cf, ngx_command_t *cmd,
 static ngx_command_t  ngx_stream_waf_commands[] = {
 
     { ngx_string("waf_stream"),
-      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
-      offsetof(ngx_stream_waf_srv_conf_t, enable),
-      NULL },
+      offsetof(ngx_stream_waf_srv_conf_t, mode),
+      &ngx_stream_waf_mode },
 
     { ngx_string("waf_geo_db"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
@@ -83,6 +95,13 @@ static ngx_command_t  ngx_stream_waf_commands[] = {
     { ngx_string("waf_geo_block"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_1MORE,
       ngx_stream_waf_set_geo_block,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("waf_asn_block"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_1MORE,
+      ngx_stream_waf_set_asn_block,
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
       NULL },
@@ -164,7 +183,7 @@ ngx_stream_waf_handler(ngx_stream_session_t *s)
 
     sscf = ngx_stream_get_module_srv_conf(s, ngx_stream_waf_module);
 
-    if (!sscf->enable) {
+    if (sscf->mode == WAF_MODE_OFF) {
         return NGX_DECLINED;
     }
 
@@ -174,6 +193,19 @@ ngx_stream_waf_handler(ngx_stream_session_t *s)
     /* resolved zone -> struct pointer (NULL until the HTTP head's init ran) */
     sh = (ngx_stream_waf_stat_zone != NULL)
          ? ngx_stream_waf_stat_zone->data : NULL;
+
+    /*
+     * Detect mode: record what WOULD have been denied via the opaque
+     * would_block helper, then downgrade the verdict to allow so the
+     * connection proceeds (and is counted as allowed below). Fail-CLOSED:
+     * only WAF_MODE_DETECT observes; any other mode keeps the deny verdict.
+     */
+    if (rc != NGX_DECLINED && sscf->mode == WAF_MODE_DETECT) {
+        ngx_http_waf_stat_stream_would_block(sh, verdict.reason);
+        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                      "waf: stream would-block (%V) [detect]", &reason);
+        rc = NGX_DECLINED;
+    }
 
     ngx_http_waf_stat_stream_bump(sh, verdict.reason, rc != NGX_DECLINED);
 
@@ -202,8 +234,8 @@ ngx_stream_waf_create_srv_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    /* pcalloc zeroes rep (all NULL/0); only the flag needs an unset sentinel */
-    conf->enable = NGX_CONF_UNSET;
+    /* pcalloc zeroes rep (all NULL/0); only the mode needs an unset sentinel */
+    conf->mode = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -215,13 +247,17 @@ ngx_stream_waf_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_stream_waf_srv_conf_t  *prev = parent;
     ngx_stream_waf_srv_conf_t  *conf = child;
 
-    ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    /* fail-CLOSED default: an unset waf_stream gate enforces */
+    ngx_conf_merge_uint_value(conf->mode, prev->mode, WAF_MODE_ENFORCE);
 
     if (conf->rep.geo_db == NULL) {
         conf->rep.geo_db = prev->rep.geo_db;
     }
     if (conf->rep.block_cc == NULL) {
         conf->rep.block_cc = prev->rep.block_cc;
+    }
+    if (conf->rep.block_asn == NULL) {
+        conf->rep.block_asn = prev->rep.block_asn;
     }
     if (conf->rep.allow_cc == NULL) {
         conf->rep.allow_cc = prev->rep.allow_cc;
@@ -312,6 +348,25 @@ ngx_stream_waf_set_geo_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     for (i = 1; i < cf->args->nelts; i++) {
         if (ngx_http_waf_country_add(cf, &sscf->rep.block_cc, &value[i])
+            != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_waf_set_asn_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_waf_srv_conf_t  *sscf = conf;
+    ngx_str_t                  *value = cf->args->elts;
+    ngx_uint_t                  i;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_http_waf_asn_add(cf, &sscf->rep.block_asn, &value[i])
             != NGX_OK)
         {
             return NGX_CONF_ERROR;

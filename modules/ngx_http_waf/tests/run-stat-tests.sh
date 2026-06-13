@@ -93,6 +93,55 @@ b=$(getcnt http_resp_403)
 curl -s -o /dev/null -A "$UA" "$A/blocked"
 a=$(getcnt http_resp_403); assert_delta http_resp_403 "$b" "$a" 1
 
+echo "== method filter (waf_method_allow / waf_method_deny -> 404) =="
+
+# whitelist: GET/HEAD pass, PUT -> 404 + blocked_method++
+b=$(getcnt http_blocked_method)
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -X PUT "$A/method-allow")
+[ "$code" = 404 ] && ok "method-allow PUT returns 404" || bad "method-allow PUT code=$code"
+a=$(getcnt http_blocked_method); assert_delta http_blocked_method "$b" "$a" 1
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "$A/method-allow")
+[ "$code" = 200 ] && ok "method-allow GET passes (200)" || bad "method-allow GET code=$code"
+
+# blacklist: DELETE (standard bit) -> 404 + blocked_method++
+b=$(getcnt http_blocked_method)
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -X DELETE "$A/method-deny")
+[ "$code" = 404 ] && ok "method-deny DELETE returns 404" || bad "method-deny DELETE code=$code"
+a=$(getcnt http_blocked_method); assert_delta http_blocked_method "$b" "$a" 1
+
+# blacklist: non-standard TRACK (string-list match) -> 404 + blocked_method++
+b=$(getcnt http_blocked_method)
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -X TRACK "$A/method-deny")
+[ "$code" = 404 ] && ok "method-deny TRACK (non-standard) returns 404" || bad "method-deny TRACK code=$code"
+a=$(getcnt http_blocked_method); assert_delta http_blocked_method "$b" "$a" 1
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "$A/method-deny")
+[ "$code" = 200 ] && ok "method-deny GET passes (200)" || bad "method-deny GET code=$code"
+
+echo "== detect mode (passes through, bumps would_block[]) =="
+D=http://127.0.0.1:28082
+
+# scanner path under detect -> 200 + http_would_block_scanner_path++
+b=$(getcnt http_would_block_scanner_path)
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "$D/.env")
+[ "$code" = 200 ] && ok "detect: scanner path passes (200)" || bad "detect scanner-path code=$code"
+a=$(getcnt http_would_block_scanner_path); assert_delta http_would_block_scanner_path "$b" "$a" 1
+
+# denied method under detect -> 200 (passed through) + http_would_block_method++
+b=$(getcnt http_would_block_method)
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" "$D/method-detect")
+[ "$code" = 200 ] && ok "detect: denied method passes (200)" || bad "detect method code=$code"
+a=$(getcnt http_would_block_method); assert_delta http_would_block_method "$b" "$a" 1
+
+echo "== JA4 fingerprint (TCP-TLS) =="
+# the client_hello wrapper computes JA4 at handshake; $waf_ja4_hash surfaces it
+ja4=$(curl -sk -o /dev/null -D - "https://127.0.0.1:28443/ja4" \
+      | awk -F': ' 'tolower($1)=="x-waf-ja4"{print $2}' | tr -d '\r')
+if echo "$ja4" | grep -Eq '^t[0-9a-z]{9}_[0-9a-f]{12}_[0-9a-f]{12}$'; then
+    ok "JA4 well-formed over TCP-TLS ($ja4)"
+else
+    bad "JA4 malformed or absent: '$ja4'"
+fi
+
 echo "== formats =="
 ct=$(curl -s -o /dev/null -w '%{content_type}' "$STAT/plain")
 echo "$ct" | grep -q 'text/plain' && ok "plain content-type" || bad "plain ct=$ct"
@@ -138,6 +187,29 @@ b=$(getcnt stream_allowed)
 curl -s --max-time 2 -o /dev/null -A "$UA" "http://127.0.0.1:29091/" 2>/dev/null
 sleep 1
 a=$(getcnt stream_allowed); assert_delta stream_allowed "$b" "$a" 1
+
+# detect mode: would-deny peer is allowed through, stream_would_block[blocklist]++
+b=$(getcnt stream_would_block_blocklist)
+curl -s --max-time 2 -o /dev/null -A "$UA" "http://127.0.0.1:29092/" 2>/dev/null
+sleep 1
+a=$(getcnt stream_would_block_blocklist); assert_delta stream_would_block_blocklist "$b" "$a" 1
+
+echo "== asn/method reasons + would_block exposed in all 3 formats =="
+# new reasons render automatically in the WAF_REASON_MAX-driven blocked loops
+curl -s "$STAT/plain" | grep -q '^http_blocked_asn '          && ok "plain: http_blocked_asn"          || bad "plain missing http_blocked_asn"
+curl -s "$STAT/plain" | grep -q '^http_blocked_method '       && ok "plain: http_blocked_method"       || bad "plain missing http_blocked_method"
+curl -s "$STAT/plain" | grep -q '^http_would_block_method '   && ok "plain: http_would_block_method"   || bad "plain missing http_would_block_method"
+curl -s "$STAT/plain" | grep -q '^stream_would_block_blocklist ' && ok "plain: stream_would_block"     || bad "plain missing stream_would_block"
+# json structure
+curl -s "$STAT/json" | jq -e '.http.blocked.asn'            >/dev/null 2>&1 && ok "json: http.blocked.asn"          || bad "json missing http.blocked.asn"
+curl -s "$STAT/json" | jq -e '.http.would_block.method'     >/dev/null 2>&1 && ok "json: http.would_block.method"   || bad "json missing http.would_block.method"
+curl -s "$STAT/json" | jq -e '.stream.would_block.blocklist'>/dev/null 2>&1 && ok "json: stream.would_block"        || bad "json missing stream.would_block"
+# json still parses with the new nested objects
+curl -s "$STAT/json" | jq -e . >/dev/null 2>&1 && ok "json still parses with would_block objects" || bad "json broken by would_block objects"
+# prometheus
+curl -s "$STAT/prometheus" | grep -q 'waf_http_blocked_total{reason="asn"}'         && ok "prom: blocked asn"          || bad "prom missing blocked asn"
+curl -s "$STAT/prometheus" | grep -q 'waf_http_would_block_total{reason="method"}'  && ok "prom: would_block method"   || bad "prom missing would_block method"
+curl -s "$STAT/prometheus" | grep -q 'waf_stream_would_block_total{reason="blocklist"}' && ok "prom: stream would_block" || bad "prom missing stream would_block"
 
 echo "== SMTP-auth (reputation_check out==NULL) =="
 # blocked Client-IP (10/8) -> Auth-Status carries the deny reason, no crash

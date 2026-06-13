@@ -1,1155 +1,822 @@
 original_request: |
-  Add a lock-free statistics / status subsystem to the existing ngx_http_waf
-  module (one .so containing ngx_http_waf_module HTTP + ngx_stream_waf_module
-  STREAM). Maintain cross-worker counters of every WAF verdict, the UA
-  classification distribution, and bounded dimensional breakdowns (per-country,
-  per-vhost) in a single shared-memory zone of ngx_atomic_t counters (no slab on
-  the hot path, no rbtree, no mutex). Expose them over an HTTP endpoint analogous
-  to stub_status via a `waf_status;` content-handler directive in three formats
-  selected by URI path (/waf/stat/prometheus, /waf/stat/json, /waf/stat/plain).
-  Re-export the nginx core stub_status connection table behind #if (NGX_STAT_STUB).
-  Add two new log-format variables $waf_country and $waf_reason alongside $waf_type,
-  sharing one per-request verdict decision (one geo lookup per request, cached in
-  the request ctx).
+  /p:task-plan docs/feature-implementation-plan.md
+  Convert the completed feature-implementation-plan.md (WAF Module Feature Expansion:
+  JA4, ASN block, method filter, detect mode, location.db cron, config docs) into a
+  function-level requirements.yaml for /p:implement.
+
 goal: |
-  Translate the two-phase-validated feature plan
-  (docs/feature-implementation-plan.md) into a function-level, dependency-ordered
-  implementation of a lock-free WAF stats/status subsystem: a reason-enum single
-  source of truth, an extended reputation_check with a write-only verdict out-param,
-  a single shm atomic counter zone (HTTP+STREAM share it via name+tag), counter
-  increments on the existing verdict choke points, two new log variables, a
-  waf_status content-handler directive, and three escaping-safe serializers
-  (plain/json/prometheus), plus the build glue.
+  Extend the vanilla-nginx dynamic WAF module (modules/ngx_http_waf/) with six features
+  over the existing shared reputation core + lock-free stats subsystem:
+    1. JA4 TLS-fingerprint detection (observability-only, NO blocking; TCP-TLS + QUIC) -> $waf_ja4_hash.
+    2. ASN-based blocking (waf_asn_block, HTTP+STREAM, WAF_REASON_ASN) -> $waf_asn.
+    3. HTTP method filtering (waf_method_allow / waf_method_deny -> 404, WAF_REASON_METHOD).
+    4. Detect mode: `waf off|detect|enforce` enum (+ `on` alias); detect bumps would_block[] + DECLINED.
+    5. location.db daily refresh cron script (download -> verify -> atomic swap -> reload). No C code.
+    6. README config-level usage docs (map-based blocking pattern). No module code.
+
 complete: true
-requirements:
-  - category: architecture
-    question: How is shared cross-worker state maintained given the module has no main/srv conf today?
-    answer: |
-      Introduce create_main_conf/init_main_conf (shm zone pointer + nvhosts) and
-      create_srv_conf/merge_srv_conf (per-vhost stat index) on the HTTP module ctx
-      (currently NULL at ngx_http_waf_module.c:200-204). A single always-on shm zone
-      "waf_status" holds one fixed ngx_atomic_t counter struct allocated once via
-      ngx_slab_alloc at init; the hot path is lock-free (ngx_atomic_fetch_add only).
-    details:
-      - No shared writable state exists today (ngx_http_waf.h:57-61 documents this).
-      - Core overlays an ngx_slab_pool_t on every shm zone; slab used ONLY for the
-        one-time struct alloc at init, never on the request path.
-      - STREAM module cannot read HTTP main conf; it resolves the SAME zone via
-        ngx_shared_memory_add with size=0 and tag=&ngx_http_waf_module.
-    options: []
-    status: answered
-  - category: architecture
-    question: How are per-reason counters and the $waf_reason variable derived without parsing log strings?
-    answer: |
-      Introduce ngx_http_waf_reason_e enum in waf_rep.h (ngx_core-only header included
-      by the stream TU) as the single source of truth feeding the counter index, the
-      $waf_reason variable string, and (optionally) the human log message. A parallel
-      waf_reason_str[] table lives in ngx_http_waf_module.c next to waf_type_str[].
-    details:
-      - The 403 verdict is overloaded (blocklist / network-flag / geo-country) and was
-        previously distinguished only by the human reason string.
-      - reputation_check gains a write-only ngx_http_waf_verdict_t *out param setting
-        out->reason on every return path.
-    options: []
-    status: answered
-  - category: data
-    question: What dimensions are tracked and how are they bounded?
-    answer: |
-      Global verdict counters, per-reason block counts (http_blocked[WAF_REASON_MAX]),
-      scanner-path status split [404,403,444], response-code counters, UA distribution
-      (http_ua[WAF_UA_MAX]), per-flag breakdown (4 real libloc bits: anon/satellite/
-      anycast/drop), per-country {total,blocked,cc16} open-addressed table (512 slots),
-      and a per-vhost block array sized at init from the server{} count. STREAM has its
-      own global + stream_denied[WAF_REASON_MAX] block plus the shared per-country table.
-    details:
-      - Country space (ISO-3166 + libloc specials A1/A2/A3/T1/XD) is a closed set < ~512.
-      - Tor has NO libloc flag bit; it surfaces as a CC "T1" geo-country verdict.
-      - Top-N client-IP tracking is explicitly OUT of scope (high cardinality, lock-hot).
-    options: []
-    status: answered
-  - category: security
-    question: What must be enforced to keep the endpoint safe?
-    answer: |
-      Escape all attacker-influenceable output unconditionally at the boundary (JSON
-      RFC 8259; Prometheus label values escape \\, ", \n) - do NOT trust geo-DB bytes
-      or server names. Integer-overflow guard on zone-size and buffer-size math.
-      NULL-guard every out-> write in reputation_check (SMTP-auth passes NULL); verdict
-      return paths stay byte-identical. Content handler runs in the content phase AFTER
-      the access phase so allow/deny is enforced before any counter render. The geo-DB
-      health block exposes created-at/vendor/network-count only - never the DB path or
-      build-host.
-    details:
-      - The "2 printable uppercase ASCII" country-byte property is an assumption, not
-        a validated invariant.
-      - Endpoint exposes operational counters only: no PII, no client IPs, no bodies.
-    options: []
-    status: answered
-  - category: interface
-    question: How is the endpoint surfaced and how is format selected?
-    answer: |
-      A new `waf_status;` directive (NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS, mirroring the
-      waf_mail_auth NOARGS template at ngx_http_waf_module.c:178-183) whose set handler
-      sets clcf->handler = ngx_http_waf_status_handler. The handler restricts to
-      GET/HEAD (else NGX_HTTP_NOT_ALLOWED), snapshots the shm struct, parses the last
-      URI path segment (/waf/stat/{prometheus,json,plain}, default plain) and dispatches
-      to the serializer. Two new NOCACHEABLE log variables $waf_country and $waf_reason
-      are registered in preconfiguration.
-    details:
-      - Operators add an access-restricted location (allow/deny) per the plan; the
-        module documents but does not enforce network policy.
-      - Variable getter contract: v->len/v->data/v->valid=1/v->no_cacheable=1/v->not_found.
-    options: []
-    status: answered
-  - category: implementation
-    question: Where do counter increments live and how is double counting avoided?
-    answer: |
-      In ngx_http_waf_preaccess_handler (:286-347) - the single HTTP verdict choke
-      point - after the early guards (r != r->main, !wlcf->enable) and the ctx-ensure
-      block: bump http_requests_total ONCE, then at each verdict return set
-      ctx->reason+verdict_set and bump the matching global / per-vhost / (if geo_done)
-      per-country counters. Mirror in ngx_stream_waf_handler (waf_stream.c:142-165):
-      stream_connections_total once, then stream_allowed / stream_denied[out.reason]
-      and the shared per-country slot when out.geo_valid. Subrequests return early.
-    details:
-      - One geo lookup per request via the shared ctx cache (country/geo_done).
-      - cc_bump is lock-free open-addressed (ngx_atomic_cmp_set claim, cc16==0 empty
-        sentinel, cc_overflow guard).
-    options: []
-    status: answered
-constraints:
-  - type: technical
-    description: |
-      The counter HOT PATH must be lock-free (ngx_atomic_fetch_add only): no slab
-      allocation, no rbtree, no shared mutex per request. The ngx_slab_pool_t header
-      that core overlays on every shm zone is used ONLY for the one-time ngx_slab_alloc
-      of the fixed struct at init.
-    impact: |
-      Forces a single fixed atomic struct with bounded dimensions (closed-set country
-      table, config-time vhost array); rules out unbounded keys / per-IP tracking.
-  - type: technical
-    description: |
-      reputation_check is shared by HTTP, STREAM, and SMTP-auth. The signature change
-      (trailing out param) must remain backward-safe: callers that do not want geo
-      output (SMTP-auth) pass NULL, and out is write-only side data that never alters
-      the control flow / security decision of any caller.
-    impact: |
-      All three call sites must be updated in the same change or the build breaks;
-      every out-> write must be NULL-guarded; verdict return paths stay byte-identical.
-  - type: technical
-    description: |
-      The reason enum + verdict type must live in waf_rep.h (ngx_core-only), NOT
-      ngx_http_waf.h (which pulls ngx_http.h). The stream TU includes only waf_rep.h.
-      The verdict struct must store primitive geo fields (country[2], flags), not the
-      ngx_http_waf_geo_result_t by value (that type lives in waf_geo.h).
-    impact: Placement error breaks the STREAM translation unit compile.
-  - type: technical
-    description: |
-      shm reload re-attach: the init(zone, data) callback distinguishes reload
-      (data argument non-NULL = previous cycle's struct), re-attach (zone->shm.exists),
-      and fresh start (ngx_slab_alloc + memzero + stamp start_time). zone->data is
-      ALWAYS NULL at init - keying off it is wrong. STREAM passes size=0 and sets no
-      init of its own. A change in server{} count changes the zone size, forces a fresh
-      segment, and resets counters (documented, accepted).
-    impact: |
-      Copy the ngx_http_limit_req_module.c:728-741 init pattern verbatim; nvhosts must
-      be counted BEFORE the zone is added (it sizes the zone).
-  - type: security
-    description: |
-      Output escaping at the boundary is mandatory and unconditional (JSON + Prometheus);
-      integer-overflow guard on all size math; NULL-guard the out param; access-phase
-      ordering enforced before render; no filesystem-path / build-host leak in the
-      geo-DB health block.
-    impact: |
-      Encoded as task implementation_details and test_requirements; a missed escape is
-      an output-injection vulnerability via a hostile geo DB or server name.
-  - type: business
-    description: |
-      No new third-party dependency; English code/comments/docs; tab indentation,
-      snake_case, nginx idioms; existing directives, verdicts, status codes and
-      $waf_type unchanged.
-    impact: Build is config-only (no CMakeLists change); no config breakage.
-success_criteria:
-  - GET /waf/stat/plain returns a stub_status-style block with WAF verdict counters and (when NGX_STAT_STUB) the core connection table.
-  - GET /waf/stat/prometheus returns valid text-exposition output with bounded labels only (reason, country, server, flag) - never a raw client IP.
-  - GET /waf/stat/json returns a well-formed JSON object with the same data nested.
-  - Triggering each verdict class increments exactly the corresponding counter, verified across all three formats.
-  - A STREAM-level reputation block increments the STREAM counter block (stream_denied[reason]).
-  - $waf_type is unchanged; $waf_country resolves to the 2-letter ISO code when a geo record exists (and geo configured) else not_found; $waf_reason resolves to the verdict token.
-  - At most ONE geo lookup per request even when $waf_country + geo blocking + per-country counter are all active (shared ctx cache).
-  - Per-country counters increment ONLY when a geo lookup actually ran; with geo disabled no per-country data and no extra lookup.
-  - Counters survive nginx -s reload (shm re-attach) as long as the zone size (server{} count) is unchanged.
-  - nginx -t passes; the .so loads; no regression in existing WAF behaviour.
-  - SMTP-auth path (out == NULL) does not NULL-deref and its allow/deny verdict is unchanged.
-  - Hostile geo-DB / server_name bytes (", \\, control chars, newline) do not break JSON or Prometheus output.
-context_summary:
-  error_handling: |
-    nginx convention: return NGX_ERROR / NGX_DECLINED / NGX_HTTP_* per call.
-    ngx_pcalloc/alloc failure -> NGX_ERROR. shm allocation failure at init ->
-    NGX_ERROR (nginx fails to start with a "waf: cannot allocate status zone" emerg).
-    Status handler rejects non-GET/HEAD with NGX_HTTP_NOT_ALLOWED. Per-country table
-    full -> bump cc_overflow and skip (defensive).
-  memory_management: |
-    Request-pool ctx (freed with the request, no manual cleanup). shm struct is a
-    one-time ngx_slab_alloc from the slab pool overlaid by core; plain ngx_atomic_t
-    fields + fixed arrays, no per-element alloc, no free path. No per-request alloc on
-    the counter path. reputation_check's out param is caller-stack owned.
-  logging_pattern: |
-    "waf: " prefix; NGX_LOG_INFO for verdicts, NGX_LOG_WARN for config warnings,
-    NGX_LOG_EMERG / ngx_conf_log_error for config errors; errno arg always 0;
-    %V for ngx_str_t *, %i for ngx_int_t. Counters ARE the signal - no per-request
-    stats logging; optional NGX_LOG_DEBUG_HTTP trace in the status handler.
-  naming_conventions: |
-    ngx_http_waf_ prefix, snake_case identifiers, UPPER_CASE macros, WAF_* enum
-    constants, tab indentation. New variables mirror $waf_type exactly.
-  key_patterns:
-    - Lock-free atomics only on the hot path (ngx_atomic_fetch_add / ngx_atomic_cmp_set).
-    - Reason-enum as the single source feeding counter index + $waf_reason variable + human log string.
-    - One geo lookup per request via the shared ctx cache (country/geo_done).
-    - Bounded dimensions only (closed-set country table, config-time vhost array) - never per-IP.
-    - Unconditional output escaping at the serializer boundary (do not trust geo-DB bytes).
-    - shm init follows ngx_http_limit_req_module.c:728-741 (data arg + shm.exists, not zone->data==NULL).
-    - STREAM resolves the same zone via name+tag with size=0 and sets no init of its own.
-implementation_plan:
-  total_effort: xl
-  effort_breakdown:
-    ss: 1
-    s: 1
-    m: 6
-    l: 4
-    xl: 0
-    xxl: 0
-  affected_files:
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_authhttp.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
-  new_files:
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
-  reference_files:
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_authhttp.c
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.h
-    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
-    - src/http/modules/ngx_http_limit_req_module.c   # external pattern: shm init(zone,data) re-attach
-    - src/http/modules/ngx_http_stub_status_module.c  # external pattern: status content handler + serializer
-  tasks:
-    - task_id: task-001
-      description: |
-        Add ngx_http_waf_reason_e enum + ngx_http_waf_verdict_t struct to waf_rep.h
-        (the ngx_core-only header), and the parallel waf_reason_str[] string table in
-        ngx_http_waf_module.c next to waf_type_str[].
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
-      function_name: null
-      type: modify
-      status: completed
-      size: m
-      size_rationale: Two type definitions in the header plus a 9-entry string table in the .c; trivial code but spans two files and is the foundational single-source-of-truth.
-      implementation_details: |
-        In waf_rep.h, BEFORE the reputation_check prototype (currently :43-44), add:
-          typedef enum {
-            WAF_REASON_NONE = 0, WAF_REASON_ALLOWLIST, WAF_REASON_BLOCKLIST,
-            WAF_REASON_GEO, WAF_REASON_GEO_WHITELIST, WAF_REASON_FLAG,
-            WAF_REASON_SCANNER_UA, WAF_REASON_EMPTY_UA, WAF_REASON_SCANNER_PATH,
-            WAF_REASON_MAX
-          } ngx_http_waf_reason_e;
-          typedef struct {
-            ngx_http_waf_reason_e reason;  /* set on every return */
-            u_char country[2];             /* copied from res.country; {0,0}=none */
-            uint16_t flags;                /* copied from res.flags */
-            unsigned geo_valid:1;          /* a geo lookup actually ran */
-          } ngx_http_waf_verdict_t;
-        Do NOT embed ngx_http_waf_geo_result_t by value (waf_geo.h is not visible to the
-        stream TU). In ngx_http_waf_module.c add a static ngx_str_t
-        waf_reason_str[WAF_REASON_MAX] next to waf_type_str[] (:26-33) with tokens:
-        none, allowlist, blocklist, geo, geo_whitelist, flag, scanner_ua, empty_ua,
-        scanner_path - using ngx_string() literals returned by reference.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: waf_type_str
-          note: Mirror this static ngx_str_t table layout exactly for waf_reason_str[] (place adjacent). Tokens are static literals returned by reference, never copied.
-          pattern_excerpt: |
-            /*
-             * enum -> $waf_type string, indexed by ngx_http_waf_ua_e. The list-backed
-             * categories occupy [0, WAF_UA_LIST_MAX); REGULAR and EMPTY follow. A hit is
-             * returned by reference (static literal), never copied.
-             */
-            static ngx_str_t  waf_type_str[WAF_UA_MAX] = {
-                ngx_string("scanner"),
-                ngx_string("ai-crawler"),
-                ngx_string("crawler"),
-                ngx_string("bot"),
-                ngx_string("regular"),
-                ngx_string("empty")
-            };
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
-          function: ngx_http_waf_reputation_check
-          note: Insert the enum + verdict struct just above this prototype. Header is ngx_core-only by design (comment lines 9-11) - this is exactly why the enum lives here and not in ngx_http_waf.h.
-          pattern_excerpt: |
-            /* full type lives in waf_geo.h; only the pointer is stored here */
-            struct ngx_http_waf_geo_db_s;
 
-            typedef struct {
-                struct ngx_http_waf_geo_db_s  *geo_db;     /* waf_geo_db               */
-                ngx_array_t                   *block_cc;   /* uint16 packed CC, block  */
-                ngx_array_t                   *allow_cc;   /* uint16 packed CC, allow  */
-                uint16_t                       flag_mask;  /* libloc flags to block    */
-                ngx_array_t                   *blocklist;  /* ngx_cidr_t -> deny       */
-                ngx_array_t                   *allowlist;  /* ngx_cidr_t -> allow      */
-            } ngx_waf_rep_conf_t;
-
-            ngx_int_t ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
-                struct sockaddr *sa, ngx_str_t *reason);
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        Compile-only at this stage. Verify the enum is visible from the stream TU
-        (waf_stream.c includes only waf_rep.h) and that WAF_REASON_MAX matches the
-        waf_reason_str[] cardinality (9 tokens).
-      dependencies: []
-    - task_id: task-002
-      description: |
-        Extend ngx_http_waf_ctx_t (ngx_http_waf.h:89-99) with geo_done:1, verdict_set:1,
-        country[2], and an ngx_http_waf_reason_e reason field.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
-      function_name: null
-      type: modify
-      status: completed
-      size: ss
-      size_rationale: Four appended struct fields; keep bitfields packed.
-      implementation_details: |
-        Append to the ngx_http_waf_ctx_t struct (keeping the two existing trailing
-        members in place):
-          unsigned              geo_done:1;    /* country[] resolved (lazy guard) */
-          unsigned              verdict_set:1; /* reason resolved by preaccess handler */
-          u_char                country[2];    /* ISO-2 verbatim; {0,0}=unknown */
-          ngx_http_waf_reason_e reason;        /* valid iff verdict_set */
-        ngx_http_waf.h includes waf_rep.h (line 18) so ngx_http_waf_reason_e is in scope.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
-          function: ngx_http_waf_ctx_t
-          note: Append the new fields after ua; ngx_http_waf_reason_e is already in scope via the "#include waf_rep.h" at line 18.
-          pattern_excerpt: |
-            typedef struct {
-                unsigned          spoof_swap:1;   /* replace body with Apache error page */
-                unsigned          spoof_done:1;   /* Apache body already emitted         */
-                unsigned          classified:1;   /* ua field already computed            */
-                ngx_str_t         spoof_body;     /* synthesized Apache error page        */
-
-                struct sockaddr  *client_sa;      /* canonical client addr (POST_READ)    */
-                socklen_t         client_socklen;
-
-                ngx_http_waf_ua_e ua;             /* $waf_type outcome (valid iff classified) */
-            } ngx_http_waf_ctx_t;
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: Compile-only; struct must remain usable by every TU that includes ngx_http_waf.h.
-      dependencies:
-        - task-001
-    - task_id: task-003
-      description: |
-        Extend ngx_http_waf_reputation_check with a trailing write-only
-        ngx_http_waf_verdict_t *out param (decl in waf_rep.h, body in
-        waf_reputation.c:14-98); set out->reason on EVERY return, copy geo
-        country/flags + geo_valid after the lookup, NULL-guard every out-> write,
-        and update all three call sites (HTTP, STREAM, SMTP-auth).
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-      function_name: ngx_http_waf_reputation_check
-      type: modify
-      status: completed
-      size: l
-      size_rationale: Touches the decl + body (every return branch) + three call sites across three files; control flow must stay byte-identical while adding write-only side data with NULL guards.
-      implementation_details: |
-        New signature (decl waf_rep.h:43-44, do NOT edit waf_reputation.h shim):
-          ngx_int_t ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
-              struct sockaddr *sa, ngx_str_t *reason, ngx_http_waf_verdict_t *out);
-        In the body set out->reason on EVERY return:
-          - sa==NULL early return (:22-24)              -> WAF_REASON_NONE
-          - allowlist short-circuit (:30)               -> WAF_REASON_ALLOWLIST
-          - static blocklist (:38)                      -> WAF_REASON_BLOCKLIST
-          - geo_db==NULL fall-through (:43)             -> WAF_REASON_NONE
-          - !res.found whitelist miss (:56)             -> WAF_REASON_GEO_WHITELIST
-          - !res.found allow (:58)                      -> WAF_REASON_NONE
-          - network flag (:64)                          -> WAF_REASON_FLAG
-          - allow_cc match (:79)                        -> WAF_REASON_NONE
-          - allow_cc miss (:83)                         -> WAF_REASON_GEO_WHITELIST
-          - block_cc match (:92)                        -> WAF_REASON_GEO
-          - final allow (:97)                           -> WAF_REASON_NONE
-        After the geo lookup at :46, when out!=NULL copy res.country (both bytes),
-        res.flags, and set out->geo_valid=1. EVERY out-> write MUST be wrapped in
-        "if (out != NULL)" (SMTP-auth passes NULL). The verdict "return rc" / status
-        codes / ngx_str_set(reason,...) paths stay byte-identical. Update call sites:
-          - HTTP ngx_http_waf_module.c:316: pass &verdict; on out.geo_valid copy
-            out.country into ctx->country and set ctx->geo_done (done in task-006).
-          - STREAM waf_stream.c:155-156: pass &verdict; later read out.reason (task-006).
-          - SMTP-auth waf_authhttp.c:65: pass NULL.
-        Add the local "ngx_http_waf_verdict_t verdict;" declaration at each non-NULL site.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-          function: ngx_http_waf_reputation_check
-          note: Every return branch here gets an out->reason assignment (NULL-guarded); the geo copy goes right after the ngx_http_waf_geo_lookup at :46. Reason strings stay for log compatibility.
-          pattern_excerpt: |
-            ngx_int_t
-            ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
-                struct sockaddr *sa, ngx_str_t *reason)
-            {
-                uint16_t                    cc16, *codes;
-                ngx_uint_t                  i;
-                ngx_http_waf_geo_result_t   res;
-
-                if (sa == NULL) {
-                    return NGX_DECLINED;
-                }
-                /* 1. allowlist short-circuits to allow */
-                if (rep->allowlist && ngx_cidr_match(sa, rep->allowlist) == NGX_OK) {
-                    return NGX_DECLINED;
-                }
-                /* 2. static blocklist */
-                if (rep->blocklist && ngx_cidr_match(sa, rep->blocklist) == NGX_OK) {
-                    ngx_str_set(reason, "static blocklist");
-                    return NGX_HTTP_FORBIDDEN;
-                }
-                /* 3. geo / network-flag reputation */
-                if (rep->geo_db == NULL) {
-                    return NGX_DECLINED;
-                }
-                ngx_http_waf_geo_lookup(rep->geo_db, sa, &res);
-                cc16 = (uint16_t) ((res.country[0] << 8) | res.country[1]);
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
-          function: ngx_stream_waf_handler
-          note: STREAM call site at :155-156 - pass a real &verdict (out->reason indexes stream_denied[] in task-006). Stream TU sees ngx_http_waf_verdict_t via waf_rep.h only.
-          pattern_excerpt: |
-            rc = ngx_http_waf_reputation_check(&sscf->rep, s->connection->sockaddr,
-                                               &reason);
-
-            if (rc != NGX_DECLINED) {
-                ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
-                              "waf: stream reputation block (%V)", &reason);
-                return NGX_STREAM_FORBIDDEN;
-            }
-            return NGX_DECLINED;
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_authhttp.c
-          function: ngx_http_waf_authhttp_handler
-          note: SMTP-auth call site at :65 - pass NULL as the new out param; this is the path the NULL guards exist for.
-          pattern_excerpt: |
-            rc = ngx_http_waf_reputation_check(&wlcf->rep, addr.sockaddr, &reason);
-
-            if (rc != NGX_DECLINED) {
-                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                              "waf: mail reputation block %V (%V)", client_ip, &reason);
-                return ngx_http_waf_authhttp_deny(r, &reason);
-            }
-            return ngx_http_waf_authhttp_allow(r, wlcf);
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_preaccess_handler
-          note: HTTP call site at :316 - pass &verdict; full counter wiring + ctx->country/geo_done copy lands in task-006, but the signature update + &verdict must compile here now.
-          pattern_excerpt: |
-            sa = (ctx->client_sa != NULL) ? ctx->client_sa : r->connection->sockaddr;
-
-            rc = ngx_http_waf_reputation_check(&wlcf->rep, sa, &reason);
-            if (rc != NGX_DECLINED) {
-                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                              "waf: reputation block (%V)", &reason);
-                return rc;
-            }
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        Build the .so; confirm all three callers compile and link. Integration: exercise
-        the SMTP-auth mail flow (out==NULL) and confirm no NULL-deref and an unchanged
-        allow/deny verdict. Confirm verdict status codes for every HTTP/STREAM class are
-        byte-identical to pre-change behaviour.
-      dependencies:
-        - task-001
-    - task_id: task-004
-      description: |
-        Create waf_status.h with the shm counter struct (ngx_http_waf_stat_shm_t),
-        per-country slot type, per-vhost block, slot constants, main/srv conf structs,
-        and the public cc_bump / status API declarations.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.h
-      function_name: null
-      type: create
-      status: completed
-      size: m
-      size_rationale: A single new header defining the data model (struct + constants + conf structs + a few prototypes); no logic.
-      implementation_details: |
-        New header guarded _WAF_STATUS_H_INCLUDED_, including ngx_http_waf.h. Define:
-          #define WAF_STAT_CC_SLOTS 512   /* closed-set country table, open-addressed */
-          #define WAF_FLAG_SLOTS    4     /* anon, satellite, anycast, drop */
-        Tor has NO flag bit (waf_geo.h:33-36 has only 4 bits); Tor surfaces as CC "T1"
-        WAF_REASON_GEO. Define ngx_http_waf_stat_cc_t {ngx_atomic_t total, blocked, cc16}
-        (cc16==0 = empty slot). Define the per-vhost block (HTTP verdict subset). Define
-        ngx_http_waf_stat_shm_t with the fixed-section counters from the plan Data Model:
-        http_requests_total, http_allowed, http_allowlist_hits,
-        http_blocked[WAF_REASON_MAX], http_scanner_path[3], http_resp_403/404/444,
-        http_ua[WAF_UA_MAX], flag_blocked[WAF_FLAG_SLOTS], stream_connections_total,
-        stream_allowed, stream_denied[WAF_REASON_MAX], start_time, last_reload_time,
-        cc_overflow, cc[WAF_STAT_CC_SLOTS]; the per-vhost array is allocated contiguously
-        AFTER the fixed struct (nvhosts * sizeof per-vhost block), so document a helper
-        accessor (e.g. a macro / inline returning the vhost block base). Declare main
-        conf { ngx_shm_zone_t *stat_zone; ngx_uint_t nvhosts; } and srv conf
-        { ngx_uint_t stat_index; } (or add to ngx_http_waf.h per task scope) and the
-        lock-free ngx_http_waf_stat_cc_bump(sh, cc16, blocked) prototype + the status
-        handler/serializer prototypes consumed by waf_status.c and ngx_http_waf_module.c.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.h
-          function: ngx_http_waf_geo_result_t
-          note: The 4 real libloc flag bits (no Tor bit) map to flag_blocked[WAF_FLAG_SLOTS]; country[2] / flags here are what the verdict struct copies and cc16 packs.
-          pattern_excerpt: |
-            /* libloc per-network flags (uint16, big-endian, at ND entry offset 8) */
-            #define NGX_HTTP_WAF_GEO_FLAG_ANON_PROXY  0x0001
-            #define NGX_HTTP_WAF_GEO_FLAG_SATELLITE   0x0002
-            #define NGX_HTTP_WAF_GEO_FLAG_ANYCAST     0x0004
-            #define NGX_HTTP_WAF_GEO_FLAG_DROP        0x0008
-
-            typedef struct {
-                ngx_uint_t   found;          /* 1 if a network matched the address */
-                u_char       country[2];     /* ISO-2, or special A1/A2/A3/T1/XD   */
-                uint16_t     flags;          /* NGX_HTTP_WAF_GEO_FLAG_*            */
-                uint32_t     asn;
-            } ngx_http_waf_geo_result_t;
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
-          function: ngx_http_waf_ua_e
-          note: WAF_UA_MAX sizes http_ua[]; the enum is the UA distribution dimension. Reason enum (WAF_REASON_MAX) sizes http_blocked[]/stream_denied[].
-          pattern_excerpt: |
-            typedef enum {
-                WAF_UA_SCANNER = 0,
-                WAF_UA_AI_CRAWLER,
-                WAF_UA_CRAWLER,
-                WAF_UA_BOT,
-                WAF_UA_LIST_MAX,
-                WAF_UA_REGULAR = WAF_UA_LIST_MAX,
-                WAF_UA_EMPTY,
-                WAF_UA_MAX
-            } ngx_http_waf_ua_e;
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: Compile-only; the new header must be self-contained and includable from both ngx_http_waf_module.c and waf_status.c.
-      dependencies:
-        - task-001
-        - task-002
-    - task_id: task-005
-      description: |
-        Add create_main_conf / init_main_conf and the shm zone creation (with the
-        limit_req-style init(zone,data) re-attach callback, tag=&ngx_http_waf_module,
-        integer-overflow-guarded size), plus the STREAM-side resolve-only re-add
-        (size=0, same name+tag, no init) in waf_stream.c's ngx_stream_waf_init.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-      function_name: ngx_http_waf_init_main_conf
-      type: modify
-      status: completed
-      size: l
-      size_rationale: New main conf create/init + the subtle reload/re-attach init callback + STREAM resolve-only re-add across two files; the highest-risk correctness area per the plan.
-      implementation_details: |
-        Fill the NULL create_main_conf/init_main_conf slots in ngx_http_waf_module_ctx
-        (:200-201). create_main_conf: ngx_pcalloc the main conf (stat_zone, nvhosts).
-        Add the zone in postconfiguration AFTER the vhost walk of task-006/step-5 (nvhosts
-        sizes it): size = sizeof(ngx_http_waf_stat_shm_t) + nvhosts*sizeof(vhost_block)
-        with an explicit integer-overflow guard on the multiply-then-add (reject and
-        EMERG on overflow). Call ngx_shared_memory_add(cf, &name, size,
-        &ngx_http_waf_module); set zone->init = ngx_http_waf_stat_init_zone; set
-        zone->tag = &ngx_http_waf_module; store the zone in main conf.
-        The init(zone, data) callback follows ngx_http_limit_req_module exactly:
-          shpool = (ngx_slab_pool_t *) zone->shm.addr;
-          if (data) { zone->data = data; sh = data; sh->last_reload_time = ngx_time();
-                      return NGX_OK; }
-          if (zone->shm.exists) { zone->data = shpool->data; return NGX_OK; }
-          sh = ngx_slab_alloc(shpool, size); if (sh==NULL) return NGX_ERROR;
-          ngx_memzero(sh, size); sh->start_time = ngx_time();
-          shpool->data = sh; zone->data = sh;
-        Do NOT key off zone->data==NULL (always NULL at init). On alloc failure log
-        NGX_LOG_EMERG "waf: cannot allocate status zone" and return NGX_ERROR.
-        STREAM (waf_stream.c ngx_stream_waf_init): call ngx_shared_memory_add with the
-        IDENTICAL name + tag=&ngx_http_waf_module and size=0 (resolve-only; the core
-        guard "if (size && size != shm.size)" then skips the conflict check); store the
-        zone pointer in the stream srv conf; set NO init (a second init would clobber
-        HTTP's). The stream handler reads zone->data after worker init.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_module_ctx
-          note: Fill the create main / init main slots (currently NULL at :200-201). Leave preconfiguration/postconfiguration/loc-conf untouched.
-          pattern_excerpt: |
-            static ngx_http_module_t  ngx_http_waf_module_ctx = {
-                ngx_http_waf_preconfiguration,     /* preconfiguration */
-                ngx_http_waf_postconfiguration,    /* postconfiguration */
-
-                NULL,                              /* create main configuration */
-                NULL,                              /* init main configuration */
-
-                NULL,                              /* create server configuration */
-                NULL,                              /* merge server configuration */
-
-                ngx_http_waf_create_loc_conf,      /* create location configuration */
-                ngx_http_waf_merge_loc_conf        /* merge location configuration */
-            };
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
-          function: ngx_stream_waf_init
-          note: Add the resolve-only ngx_shared_memory_add(size=0, same name+tag) here AFTER the phase-handler push; do NOT set zone->init. Stash the zone pointer for the handler.
-          pattern_excerpt: |
-            static ngx_int_t
-            ngx_stream_waf_init(ngx_conf_t *cf)
-            {
-                ngx_stream_handler_pt        *h;
-                ngx_stream_core_main_conf_t  *cmcf;
-
-                cmcf = ngx_stream_conf_get_module_main_conf(cf, ngx_stream_core_module);
-
-                h = ngx_array_push(&cmcf->phases[NGX_STREAM_ACCESS_PHASE].handlers);
-                if (h == NULL) {
-                    return NGX_ERROR;
-                }
-                *h = ngx_stream_waf_handler;
-                return NGX_OK;
-            }
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        nginx -t passes; .so loads. Reload test: counters survive nginx -s reload when
-        server{} count is unchanged (re-attach via data arg), last_reload_time updates.
-        Changing server{} count forces a fresh segment and resets counters (documented).
-        Confirm a non-zero divergent STREAM size would EMERG (negative check) - STREAM
-        must pass size=0. Integer-overflow guard reviewed.
-      dependencies:
-        - task-004
-    - task_id: task-006
-      description: |
-        Add create_srv_conf / merge_srv_conf and the per-vhost stat_index assignment by
-        walking cmcf->servers in postconfiguration (before the zone add), storing nvhosts
-        in main conf.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-      function_name: ngx_http_waf_postconfiguration
-      type: modify
-      status: completed
-      size: m
-      size_rationale: New srv conf create/merge + a cmcf->servers walk assigning sequential indices; bounded, single-file.
-      implementation_details: |
-        Fill the NULL create_srv_conf/merge_srv_conf slots (:203-204). create_srv_conf
-        ngx_pcalloc's the srv conf {stat_index} (UNSET sentinel); merge_srv_conf inherits.
-        In postconfiguration (:733-761), BEFORE adding the zone (task-005), walk
-        cmcf->servers (array of ngx_http_core_srv_conf_t*); for each, reach the WAF srv
-        conf via cscf->ctx->srv_conf[ngx_http_waf_module.ctx_index] and assign a
-        sequential stat_index (0..nvhosts-1); store the final count as wmcf->nvhosts.
-        This must run BEFORE ngx_shared_memory_add since nvhosts sizes the zone. Keep the
-        existing POST_READ + PREACCESS phase pushes and spoof_init untouched.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_postconfiguration
-          note: Insert the cmcf->servers walk + nvhosts store + zone add here, before the existing returns; cmcf is already fetched at :739.
-          pattern_excerpt: |
-            static ngx_int_t
-            ngx_http_waf_postconfiguration(ngx_conf_t *cf)
-            {
-                ngx_http_handler_pt        *h;
-                ngx_http_core_main_conf_t  *cmcf;
-
-                cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-                h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
-                if (h == NULL) { return NGX_ERROR; }
-                *h = ngx_http_waf_postread_handler;
-
-                h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
-                if (h == NULL) { return NGX_ERROR; }
-                *h = ngx_http_waf_preaccess_handler;
-
-                if (ngx_http_waf_spoof_init(cf) != NGX_OK) { return NGX_ERROR; }
-                return NGX_OK;
-            }
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        2-vhost integration test: each server{} block gets a distinct stat_index; a
-        request to each vhost bumps its own per-vhost block. A server with no assigned
-        index falls back to index 0 (runtime bounds check < nvhosts).
-      dependencies:
-        - task-004
-    - task_id: task-007
-      description: |
-        Wire counter increments into ngx_http_waf_preaccess_handler (:286-347): fetch
-        main+srv conf, bump http_requests_total once after the early guards, set
-        ctx->reason+verdict_set and bump global/per-vhost/(if geo_done)per-country
-        counters at each verdict return; implement the lock-free cc_bump and mirror in
-        ngx_stream_waf_handler.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-      function_name: ngx_http_waf_preaccess_handler
-      type: modify
-      status: completed
-      size: l
-      size_rationale: Touches every verdict return in two handlers plus the lock-free open-addressed cc_bump claim protocol; the core hot-path logic with subtle atomics.
-      implementation_details: |
-        In preaccess_handler, after the early guards and ctx-ensure block (after :312):
-        fetch wmcf = ngx_http_get_module_main_conf(r, ngx_http_waf_module) -> sh =
-        wmcf->stat_zone->data; wscf = ngx_http_get_module_srv_conf(...) -> idx =
-        (wscf->stat_index < wmcf->nvhosts) ? wscf->stat_index : 0. Bump
-        sh->http_requests_total ONCE here. Pass &verdict into reputation_check (task-003);
-        when verdict.geo_valid copy verdict.country into ctx->country and set
-        ctx->geo_done; cc16 = (country[0]<<8)|country[1]. At each verdict return set
-        ctx->reason + ctx->verdict_set and bump: http_allowed (allow paths, allowlist vs
-        none both map here) or http_blocked[reason]; http_scanner_path[0|1|2] for the
-        scanner-path verdict (map 404/403/444); http_resp_{403,404,444}; http_ua[ctx->ua];
-        flag_blocked[bit->slot] ONLY for WAF_REASON_FLAG (map res.flags & flag_mask via an
-        explicit bit->slot table, NOT Tor); the per-vhost block at idx; and if geo_done
-        call ngx_http_waf_stat_cc_bump(sh, cc16, blocked?). cc_bump: open-addressed probe;
-        empty slot cc16==0; claim with ngx_atomic_cmp_set(&slot->cc16, 0, key); on CAS
-        fail re-read key and reuse if ==key else probe next; if all WAF_STAT_CC_SLOTS taken
-        bump sh->cc_overflow and skip. Bump slot->total always, slot->blocked iff blocked.
-        Mirror in ngx_stream_waf_handler (waf_stream.c:142-165): read sh from the stream
-        zone pointer (task-005); bump stream_connections_total once; stream_allowed or
-        stream_denied[verdict.reason]; cc_bump the shared per-country slot when
-        verdict.geo_valid. All increments are ngx_atomic_fetch_add; no locks.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_preaccess_handler
-          note: The single HTTP verdict choke point. Each of the three "return rc / NGX_HTTP_NOT_FOUND" branches plus the final NGX_DECLINED gets the reason+counter wiring; the once-per-request bump goes right after the ctx-ensure block.
-          pattern_excerpt: |
-            ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
-            if (ctx == NULL) {
-                ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_ctx_t));
-                if (ctx == NULL) { return NGX_ERROR; }
-                ngx_http_set_ctx(r, ctx, ngx_http_waf_module);
-            }
-            sa = (ctx->client_sa != NULL) ? ctx->client_sa : r->connection->sockaddr;
-            rc = ngx_http_waf_reputation_check(&wlcf->rep, sa, &reason);
-            if (rc != NGX_DECLINED) {
-                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                              "waf: reputation block (%V)", &reason);
-                return rc;
-            }
-            ngx_http_waf_ua_classify(r, wlcf, ctx);
-            if (wlcf->bot_block
-                && (ctx->ua == WAF_UA_SCANNER || ctx->ua == WAF_UA_EMPTY)) {
-                return NGX_HTTP_NOT_FOUND;
-            }
-            rc = ngx_http_waf_scanner_lookup(wlcf, &r->uri);
-            if (rc != NGX_DECLINED) { return rc; }
-            return NGX_DECLINED;
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
-          function: ngx_stream_waf_handler
-          note: Mirror the increments here - stream_connections_total once, stream_allowed/stream_denied[verdict.reason], shared cc_bump when verdict.geo_valid. verdict comes from the task-003 call-site update.
-          pattern_excerpt: |
-            rc = ngx_http_waf_reputation_check(&sscf->rep, s->connection->sockaddr,
-                                               &reason);
-            if (rc != NGX_DECLINED) {
-                ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
-                              "waf: stream reputation block (%V)", &reason);
-                return NGX_STREAM_FORBIDDEN;
-            }
-            return NGX_DECLINED;
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-          function: ngx_http_waf_reputation_check
-          note: cc16 packing is the same formula used here (:67); the empty-slot==0 invariant holds because both country bytes are printable uppercase ASCII.
-          pattern_excerpt: |
-                cc16 = (uint16_t) ((res.country[0] << 8) | res.country[1]);
-                if (rep->allow_cc) {
-                    codes = rep->allow_cc->elts;
-                    for (i = 0; i < rep->allow_cc->nelts; i++) {
-                        if (codes[i] == cc16) { return NGX_DECLINED; }
-                    }
-                    ngx_str_set(reason, "geo not whitelisted");
-                    return NGX_HTTP_NOT_FOUND;
-                }
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        For each verdict class (blocklist 403, geo-country 403, network-flag 403,
-        geo-not-whitelisted 404, scanner-UA 404, empty-UA 404, scanner-path 404/403/444)
-        send a triggering request and assert exactly-one increment of the corresponding
-        counter across all three formats. Allow path increments http_allowed +
-        http_requests_total only. STREAM block increments stream_denied[...]. Per-country
-        bumps only when geo ran. cc_bump near-capacity bumps cc_overflow, no corruption.
-        Subrequest (r != r->main) does not double count.
-      dependencies:
-        - task-003
-        - task-005
-        - task-006
-    - task_id: task-008
-      description: |
-        Register $waf_country and $waf_reason in ngx_http_waf_preconfiguration (:681-695)
-        and add their getters after the $waf_type getter (:730), mirroring its contract.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-      function_name: ngx_http_waf_country_variable
-      type: modify
-      status: completed
-      size: m
-      size_rationale: Two new variable registrations + two getters; the $waf_country getter has lazy geo-lookup-on-cache-miss logic.
-      implementation_details: |
-        In preconfiguration add two ngx_http_add_variable(... NGX_HTTP_VAR_NOCACHEABLE)
-        calls for "waf_country" and "waf_reason", each setting var->get_handler. After the
-        $waf_type getter (:730) add:
-          ngx_http_waf_country_variable: ensure ctx (lazy pcalloc as in $waf_type); if
-          !ctx->geo_done && wlcf->rep.geo_db != NULL do a single ngx_http_waf_geo_lookup
-          into a local res, cache res.country into ctx->country and set ctx->geo_done.
-          Emit the 2 country bytes (v->len=2, v->data=ctx->country, valid=1,
-          no_cacheable=1) or set v->not_found=1 ("not_found") when no code is available.
-          ngx_http_waf_reason_variable: ensure ctx; emit waf_reason_str[ctx->reason]
-          (default WAF_REASON_NONE -> "none" when !verdict_set). Same getter contract:
-          v->len/v->data/v->valid=1/v->no_cacheable=1/v->not_found.
-        The lazy lookup keeps the "one geo lookup per request" guarantee: if the preaccess
-        handler already ran geo, geo_done is set and no second lookup occurs.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_type_variable
-          note: Mirror this getter exactly (ctx lazy-alloc, classify-if-needed, fill v). $waf_reason indexes waf_reason_str[] the same way; $waf_country adds the lazy geo lookup guarded by geo_done + geo_db != NULL.
-          pattern_excerpt: |
-            static ngx_int_t
-            ngx_http_waf_type_variable(ngx_http_request_t *r,
-                ngx_http_variable_value_t *v, uintptr_t data)
-            {
-                ngx_str_t                *s;
-                ngx_http_waf_ctx_t       *ctx;
-                ngx_http_waf_loc_conf_t  *wlcf;
-
-                ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
-                if (ctx == NULL) {
-                    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_ctx_t));
-                    if (ctx == NULL) { return NGX_ERROR; }
-                    ngx_http_set_ctx(r, ctx, ngx_http_waf_module);
-                }
-                if (!ctx->classified) {
-                    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
-                    ngx_http_waf_ua_classify(r, wlcf, ctx);
-                }
-                s = &waf_type_str[ctx->ua];
-                v->len = s->len;  v->data = s->data;
-                v->valid = 1;  v->no_cacheable = 1;  v->not_found = 0;
-                return NGX_OK;
-            }
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_preconfiguration
-          note: Add two more add_variable blocks identical in shape to the waf_type one; each NGX_HTTP_VAR_NOCACHEABLE with its own get_handler.
-          pattern_excerpt: |
-            static ngx_int_t
-            ngx_http_waf_preconfiguration(ngx_conf_t *cf)
-            {
-                ngx_str_t             name = ngx_string("waf_type");
-                ngx_http_variable_t  *var;
-
-                var = ngx_http_add_variable(cf, &name, NGX_HTTP_VAR_NOCACHEABLE);
-                if (var == NULL) { return NGX_ERROR; }
-                var->get_handler = ngx_http_waf_type_variable;
-                return NGX_OK;
-            }
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.h
-          function: ngx_http_waf_geo_lookup
-          note: The lazy $waf_country lookup calls this with the request's sockaddr into a local res; res.country -> ctx->country. Only invoked when geo_db != NULL and !geo_done.
-          pattern_excerpt: |
-            /* Look up an address (AF_INET / AF_INET6). Fills res (res->found=0 if none). */
-            void ngx_http_waf_geo_lookup(ngx_http_waf_geo_db_t *db, struct sockaddr *sa,
-                ngx_http_waf_geo_result_t *res);
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        Configure a log_format using $waf_country and $waf_reason; inspect the access log
-        line for each verdict class - $waf_reason shows the token (blocklist/geo/flag/
-        geo_whitelist/scanner_ua/empty_ua/scanner_path/allowlist/none), $waf_country shows
-        the 2-letter code or not_found. Assert exactly one geo lookup per request even
-        with $waf_country + geo blocking + per-country active. $waf_type unchanged.
-      dependencies:
-        - task-002
-        - task-003
-    - task_id: task-009
-      description: |
-        Add the waf_status directive to ngx_http_waf_commands[] (NGX_HTTP_LOC_CONF|
-        NGX_CONF_NOARGS) + its set handler ngx_http_waf_set_status, and implement
-        ngx_http_waf_status_handler (GET/HEAD only, shm snapshot, URI-segment format
-        dispatch) in the new waf_status.c.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
-      function_name: ngx_http_waf_status_handler
-      type: create
-      status: completed
-      size: m
-      size_rationale: One command-table entry + a tiny set handler + the dispatcher (method check, snapshot, last-segment parse, serializer dispatch); serializers themselves are task-010.
-      implementation_details: |
-        Create waf_status.c (includes ngx_http_waf.h + waf_status.h). Add to
-        ngx_http_waf_commands[] (before ngx_null_command at :192), mirroring the
-        waf_mail_auth NOARGS template (:178-183):
-          { ngx_string("waf_status"), NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
-            ngx_http_waf_set_status, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL }
-        ngx_http_waf_set_status: fetch clcf via ngx_http_conf_get_module_loc_conf(cf,
-        ngx_http_core_module), set clcf->handler = ngx_http_waf_status_handler, return
-        NGX_CONF_OK. ngx_http_waf_status_handler(r): if (r->method & (NGX_HTTP_GET|
-        NGX_HTTP_HEAD)) == 0 return NGX_HTTP_NOT_ALLOWED; ngx_http_discard_request_body;
-        fetch sh = wmcf->stat_zone->data; take a consistent snapshot by reading each
-        atomic once into a local struct; parse the LAST path segment of r->uri (bounded)
-        -> {prometheus, json, plain}; default plain on unknown; dispatch to the matching
-        serializer (task-010) which sets Content-Type, computes Content-Length, sends
-        headers then the chain. The content phase runs AFTER access, so allow/deny is
-        enforced before any render (verify the handler does not short-circuit access).
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: ngx_http_waf_commands
-          note: Mirror this NOARGS content-handler-installing entry for waf_status. ngx_command_t layout is {name, type, set, conf, offset, post}.
-          pattern_excerpt: |
-            { ngx_string("waf_mail_auth"),
-              NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
-              ngx_http_waf_set_mail_auth,
-              NGX_HTTP_LOC_CONF_OFFSET,
-              0,
-              NULL },
-
-            { ngx_string("waf_mail_backend"),
-              NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
-              ngx_http_waf_set_mail_backend,
-              NGX_HTTP_LOC_CONF_OFFSET,
-              0,
-              NULL },
-
-              ngx_null_command
-            };
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        Status handler rejects non-GET/HEAD with 405. Unknown final segment serves the
-        plain default. allow/deny verified: a denied client never reaches the serializer
-        (access phase runs first). nginx -t passes with the new directive.
-      dependencies:
-        - task-004
-        - task-005
-    - task_id: task-010
-      description: |
-        Implement the three serializers in waf_status.c - plain (stub-style default),
-        json (RFC 8259 escaping), prometheus (text-exposition with bounded labels) -
-        each emitting the #if (NGX_STAT_STUB) core connection table, with unconditional
-        output escaping, overflow-guarded buffer sizing, and chained ngx_chain_t output.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
-      function_name: ngx_http_waf_status_prometheus
-      type: create
-      status: completed
-      size: l
-      size_rationale: Three full renderers over the entire counter model (per-reason, per-flag, per-country, per-vhost, UA, health, core table) with two distinct escaping schemes and computed-upper-bound chained buffers.
-      implementation_details: |
-        Three functions taking the snapshot + r, building a chained ngx_chain_t of
-        pool-allocated bufs (or one buf grown to a computed upper bound:
-        fixed_lines + nvhosts*per_vhost_len + n_cc*cc_line_len) - guard the upper-bound
-        multiplication against overflow. Set Content-Type (text/plain for plain &
-        prometheus, application/json for json), compute Content-Length from the assembled
-        chain, send headers then the chain (HEAD: headers only).
-          plain: stub_status-style block - waf_up, uptime (now - start_time),
-            last_reload_time, geo-DB health (created-at/vendor/network-count only, NEVER
-            the DB path/build-host), loaded-list cardinalities, then the verdict counters.
-          json: nested object; escape every emitted string ", \\, and control chars per
-            RFC 8259 (country bytes, server names, reason/flag tokens) unconditionally.
-          prometheus: metrics waf_http_requests_total, waf_http_blocked_total{reason=...},
-            waf_http_blocked_total{reason="flag",flag=...},
-            waf_blocked_by_country_total{country=...} (total/blocked),
-            waf_blocked_by_vhost_total{server=...,reason=...}, waf_ua_total{class=...},
-            health gauges; escape every label value (\\, ", \n) per the text-exposition
-            spec. NEVER emit a client IP.
-        All three: #if (NGX_STAT_STUB) declare extern ngx_atomic_t *ngx_stat_active/
-        reading/writing/waiting/accepted/handled/requests and emit the core connection
-        table; #else omit it (plain: a "# stub_status not available" comment line).
-        Escape UNCONDITIONALLY - do not trust the geo DB to yield clean bytes.
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.h
-          function: ngx_http_waf_geo_db_t
-          note: The geo-DB health block may read only metadata-style fields; it MUST NOT emit db->path (filesystem path leak). Country bytes flow through escaping unconditionally.
-          pattern_excerpt: |
-            typedef struct ngx_http_waf_geo_db_s {
-                u_char      *map;                            /* mmap base address  */
-                size_t       map_size;                       /* mmap length        */
-
-                u_char      *block[NGX_HTTP_WAF_GEO_BLOCKS]; /* pointers into map  */
-                uint32_t     block_len[NGX_HTTP_WAF_GEO_BLOCKS];
-
-                uint32_t     ipv4root;                       /* IPv4 trie root node*/
-                uint16_t     cc_map[32 * 32];                /* 10-bit CC index    */
-
-                ngx_str_t    path;   /* <-- DO NOT emit: filesystem path leak */
-            } ngx_http_waf_geo_db_t;
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
-          function: waf_type_str
-          note: UA class labels for waf_ua_total{class=...} come from this table (indices WAF_UA_SCANNER..WAF_UA_EMPTY); reason labels come from waf_reason_str[] (task-001). Both are config-derived/static but still escaped.
-          pattern_excerpt: |
-            static ngx_str_t  waf_type_str[WAF_UA_MAX] = {
-                ngx_string("scanner"),
-                ngx_string("ai-crawler"),
-                ngx_string("crawler"),
-                ngx_string("bot"),
-                ngx_string("regular"),
-                ngx_string("empty")
-            };
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        /waf/stat/json parses with jq; /waf/stat/prometheus passes promtool check metrics.
-        Escaping test: a server_name containing ", \\ and a newline keeps both JSON and
-        Prometheus output valid (escaped, not injected). Hostile geo-DB with non-ASCII /
-        control bytes in a country field does not break the output. No client IP / PII in
-        any format. With nginx built WITHOUT stub_status the endpoint still works and
-        omits the core table. Overflow guard on buffer-size math reviewed.
-      dependencies:
-        - task-009
-    - task_id: task-011
-      description: |
-        Register src/waf_status.c in waf_srcs and src/waf_status.h in waf_deps in the
-        addon config; reconfigure (touch OpenSSL ssl.h first) and rebuild the .so.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
-      function_name: null
-      type: modify
-      status: completed
-      size: s
-      size_rationale: Two one-line list edits; no CMakeLists change. The reconfigure/build step has a known OpenSSL-rebuild trap to avoid.
-      implementation_details: |
-        In waf_deps (:14-20) append "\\\n         $ngx_addon_dir/src/waf_status.h".
-        In waf_srcs (:22-28) append "\\\n         $ngx_addon_dir/src/waf_status.c" after
-        the waf_stream.c entry. Then reconfigure: per the build recipe, touch the OpenSSL
-        ssl.h BEFORE make to avoid triggering a doomed full OpenSSL rebuild; then
-        cmake --build build --target waf_module. No CMakeLists.txt change (it already
-        passes --add-dynamic-module and provides the waf_module fast-rebuild target).
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
-          function: waf_srcs
-          note: Append waf_status.c to waf_srcs and waf_status.h to waf_deps using the same backslash-continued here-string layout. A new .c requires a reconfigure (not just a rebuild).
-          pattern_excerpt: |
-            waf_deps="$ngx_addon_dir/src/ngx_http_waf.h \
-                     $ngx_addon_dir/src/waf_match.h \
-                     $ngx_addon_dir/src/waf_spoof.h \
-                     $ngx_addon_dir/src/waf_geo.h \
-                     $ngx_addon_dir/src/waf_rep.h \
-                     $ngx_addon_dir/src/waf_reputation.h \
-                     $ngx_addon_dir/src/waf_authhttp.h"
-
-            waf_srcs="$ngx_addon_dir/src/ngx_http_waf_module.c \
-                     $ngx_addon_dir/src/waf_match.c \
-                     $ngx_addon_dir/src/waf_spoof.c \
-                     $ngx_addon_dir/src/waf_geo.c \
-                     $ngx_addon_dir/src/waf_reputation.c \
-                     $ngx_addon_dir/src/waf_authhttp.c \
-                     $ngx_addon_dir/src/waf_stream.c"
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        Reconfigure + cmake --build build --target waf_module succeeds; the .so loads;
-        nginx -t passes; no regression in existing WAF behaviour.
-      dependencies:
-        - task-007
-        - task-008
-        - task-010
-    - task_id: task-012
-      description: |
-        Curl-based integration test suite against the sandbox nginx covering every
-        verdict class across all three formats, the STREAM block path, the SMTP-auth
-        out==NULL path, reload counter preservation, and output escaping with a hostile
-        server_name / geo DB.
-      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
-      function_name: null
-      type: test
-      status: completed
-      size: m
-      size_rationale: No C unit framework exists; this is a scripted curl integration matrix exercising the lock-free claim indirectly and all security requirements.
-      implementation_details: |
-        No C unit-test framework exists - drive the sandbox nginx with curl. Configure a
-        waf_status location (allow 127.0.0.1; deny all) plus known block rules (a
-        blocklist CIDR, a geo block, a scanner-path list, a scanner-UA list) and a
-        log_format using $waf_country/$waf_reason. For each verdict class send a
-        triggering request, then GET /waf/stat/{plain,json,prometheus} and assert the
-        corresponding counter incremented by exactly 1 in all three. Assert the allow
-        path bumps http_allowed + http_requests_total only. Drive a STREAM block and
-        assert stream_denied[...] increments. Exercise the mail-auth flow (out==NULL) and
-        confirm no NULL-deref / unchanged verdict. Reload (nginx -s reload) with unchanged
-        server{} count and assert counters preserved + last_reload_time updated. Feed a
-        server_name with ", \\ and newline and a hostile geo DB; assert JSON parses (jq)
-        and Prometheus validates (promtool). Assert no client IP appears in any format.
-        Assert one geo lookup per request (debug-log count or reason/country consistency).
-      code_references:
-        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
-          function: ngx_http_waf_reputation_check
-          note: The verdict branches here define the test matrix - blocklist 403, geo-not-whitelisted 404, network flag 403, geo country 403, plus UA / scanner-path verdicts in the preaccess handler. Each must map to exactly one counter.
-          pattern_excerpt: |
-                if (rep->blocklist && ngx_cidr_match(sa, rep->blocklist) == NGX_OK) {
-                    ngx_str_set(reason, "static blocklist");
-                    return NGX_HTTP_FORBIDDEN;                 /* WAF_REASON_BLOCKLIST */
-                }
-                ...
-                if (rep->allow_cc) {                            /* whitelist miss */
-                    ngx_str_set(reason, "geo not whitelisted");
-                    return NGX_HTTP_NOT_FOUND;                 /* WAF_REASON_GEO_WHITELIST */
-                }
-                if (rep->flag_mask && (res.flags & rep->flag_mask)) {
-                    ngx_str_set(reason, "network flag");
-                    return NGX_HTTP_FORBIDDEN;                 /* WAF_REASON_FLAG */
-                }
-      api_references:
-        - docs/feature-implementation-plan.md
-      test_requirements: |
-        This task IS the integration test. Pass criteria = every success_criteria and
-        every security-testing checklist item in the feature plan verified green.
-      dependencies:
-        - task-011
-
-# ---------------------------------------------------------------------------
-# Implementation completion record (filled by /p:implement Section 4 Phase C)
-# ---------------------------------------------------------------------------
 implementation_complete: true
-implementation_date: 2026-06-13
+implementation_date: "2026-06-13"
 inspector_verdict: COMPLETE
 inspector_iterations: 1
 security_verdict: APPROVE
 security_iterations: 1
 implementation_notes: |
-  All 12 tasks implemented, build clean under -Werror -W -Wall, 32/32 curl
-  integration assertions pass. Sound deviations from the plan pseudocode:
-  (1) STREAM cannot include ngx_http.h, so the shm layout struct stays
-      HTTP-only in waf_status.h and the STREAM head pokes counters through
-      opaque-pointer helpers (ngx_http_waf_stat_cc_bump / _stream_bump)
-      declared in the ngx_core-only waf_rep.h and defined in
-      ngx_http_waf_module.c (so they link without waf_status.c).
-  (2) STREAM stores the resolved zone in a file-static pointer (singleton).
-  (3) init(zone,data) follows ngx_http_limit_req_module: shm_zone->data holds
-      the main conf at add-time (to size from nvhosts) then is swapped to the
-      struct pointer; HTTP reads wmcf->stat_zone->data, STREAM reads its
-      zone->data, both yield the same struct.
-  (4) geo-DB health block emits network-count + mapped size only (the geo_db
-      struct does not retain created-at/vendor); never the path.
-  (5) Internal redirects (index/try_files; r==r->main, r->internal) re-run the
-      preaccess handler and thus re-count - the plan required only subrequest
-      (r!=r->main) dedup, which is implemented; re-counting mirrors how the
-      WAF itself re-evaluates redirects.
-implementation_open_items:
-  - id: G1
-    severity: LOW
-    type: documentation
-    description: |
-      The feature plan's "Documentation Updates Required" section lists an
-      external module README entry for waf_status + the three endpoints +
-      the allow/deny requirement, a $waf_country/$waf_reason variable doc, and
-      a metrics reference. These were NOT among the 12 function-level tasks
-      (code is well-commented; headers documented). RESOLVED 2026-06-13: per
-      user decision the README is sufficient - README.md extended with a
-      `waf_status` directive-table row, a $waf_country/$waf_reason "Verdict
-      variables" subsection, and a "Statistics / status endpoint" section
-      (formats, allow/deny, tracked metrics, escaping, reload semantics). The
-      separate metrics-reference doc and Doxygen pass were deferred by the user.
-    status: resolved
-implementation_security_open_items:
-  - id: F4
-    owasp: A03-Injection
-    cwe: CWE-117
-    severity: LOW
-    file: modules/ngx_http_waf/src/waf_status.c
-    line: 71
-    description: |
-      ngx_http_waf_prom_escape() escapes backslash, double-quote and newline
-      (exactly the plan spec) but does not strip other control bytes (e.g.
-      \r) from a server_name rendered into a Prometheus label. server_name is
-      operator-controlled at config-parse time, NOT runtime-attacker-reachable,
-      so impact is cosmetic/parser-fragility only. RESOLVED 2026-06-13: per
-      user request, ngx_http_waf_prom_escape now drops control bytes < 0x20
-      (waf_status.c:89-92); .so rebuilt clean under -Werror, 32/32 integration
-      assertions still pass (no regression).
-    status: resolved
-  - id: PLAIN-CC
-    severity: INFO
-    file: modules/ngx_http_waf/src/waf_status.c
-    line: 99
-    description: |
-      Plain (unquoted) format sanitizes hostile geo-DB country bytes by
-      collapsing non-[A-Z0-9] to '?' (ngx_http_waf_cc_chars), since plain has
-      no quoting scheme. Intended hardening; confirmed acceptable.
+  GROUP A (detect mode, ASN block, method filter, would_block stats) + GROUP B
+  (JA4) implemented and verified: full module builds clean under -Werror -W
+  -Wall; 57/57 integration assertions pass (incl. live $waf_ja4_hash over TLS);
+  6/6 JA4 unit tests pass incl. the FoxIO canonical vector bit-for-bit.
+  Phase A impl-inspector: COMPLETE (17/17 in-scope items). Phase B security:
+  APPROVE (0 surviving findings; the attacker-controlled JA4 parser bounds,
+  OPENSSL_free leak discipline, and the handshake-cb NULL-guard were all
+  verified correct against the nginx oracle).
+  Deviations: task-017 (location.db cron script) DESCOPED by the user
+  mid-implementation ("drop it for now") -> marked cancel; README documents the
+  manual curl+xz DB refresh instead. task-013 reads $waf_ja4_hash directly from
+  SSL ex-data (set by the client_hello callback) instead of caching in the
+  request ctx -- the SSL connection is the cache; behavior identical.
+
+requirements:
+  - category: architecture
+    question: "JA4 raw ClientHello access without patching nginx/OpenSSL?"
+    answer: |
+      Wrapper-chain (Option 5, partner-selected). The module installs its own client_hello_cb
+      on each server SSL_CTX in postconfiguration; the wrapper computes JA4, stores it on the SSL*,
+      then chains to the public ngx_ssl_client_hello_callback() so nginx SNI processing runs unchanged.
+      Verified feasible: ngx_ssl_client_hello_callback non-static + header-declared (ngx_event_openssl.h:299,
+      under #ifdef SSL_CLIENT_HELLO_SUCCESS), ngx_ssl_client_hello_arg_index extern (:410).
+    details:
+      - "Covers TCP-TLS (HTTP/1.1+H2) AND QUIC/H3 from one hook (cb fires on QUIC; no QUIC guard in OpenSSL tls_early_post_process_client_hello)."
+      - "No nginx/OpenSSL source patching; no SNI reproduction."
+      - "DRIFT: ngx_ssl_client_hello_callback is inside #ifdef SSL_CLIENT_HELLO_SUCCESS (ngx_event_openssl.h:298) -> JA4 hook code must be inside the same guard."
+    options: ["OpenSSL patch", "nginx patch", "cb takeover + SNI repro", "msg_callback TCP-only", "wrapper-chain"]
+    status: answered
+  - category: architecture
+    question: "JA4 string-assembly testing approach (no C unit infra exists in the module)?"
+    answer: |
+      Pure core + unit scaffold (partner-selected 2026-06-13). Split into:
+        - ngx_http_waf_ja4_build(): PURE core on raw uint16 arrays (ciphers/exts/sigalgs) + ALPN bytes,
+          stdint + OpenSSL SHA256 only, NO nginx types -> standalone-compilable & unit-testable.
+        - ngx_http_waf_ja4_compute(SSL*, pool, out): thin SSL-extractor wrapper that calls the getters
+          then ngx_http_waf_ja4_build().
+      New tests/unit/ scaffold: vendor ctest.h (single-header, NOT present in repo), test-ja4.c includes
+      waf_ja4.c under -DWAF_JA4_UNIT_TEST (nginx/SSL parts #ifdef'd out), run-unit-tests.sh compiles with
+      `cc -DWAF_JA4_UNIT_TEST ... -lcrypto`. Asserts FoxIO canonical vector + GREASE + ALPN hex-fallback +
+      empty-sigalg c-path + count-clamp. This also isolates the attacker-controlled parser for CWE-125/787/190/401.
+    details:
+      - "waf_ja4.c MUST wrap nginx includes + SSL wrapper + cb in `#ifndef WAF_JA4_UNIT_TEST` so the core compiles alone."
+      - "Pure core uses standard snprintf/memcpy/qsort + OpenSSL SHA256 (NOT ngx_snprintf) to stay nginx-free."
+      - "No ctest.h in repo -> task-012 vendors a single-header ctest.h into tests/unit/ (see p:ctest.h skill)."
+    options: ["pure core + unit scaffold", "integration + Wireshark only"]
+    status: answered
+  - category: data
+    question: "Reason-enum / counter-array growth strategy?"
+    answer: |
+      Append WAF_REASON_ASN, WAF_REASON_METHOD immediately BEFORE WAF_REASON_MAX (waf_rep.h:53) to keep
+      existing indices stable. All reason-indexed arrays (http_blocked[], stream_denied[], vhost blocked[])
+      and all 3 serializer loops are WAF_REASON_MAX-driven -> new reasons auto-render. JA4 adds NO reason
+      (observability-only). Shm layout grows -> fresh zone on .so reload (stop+start), counters reset (documented).
+    details:
+      - "waf_reason_str[] (ngx_http_waf_module.c:43-53) must gain ngx_string(\"asn\"), ngx_string(\"method\") at indices 9,10."
+      - "would_block[] arrays are NEW reason-indexed arrays needing EXPLICIT serializer rows (not auto)."
+    options: []
+    status: answered
+  - category: interface
+    question: "waf directive backward compatibility?"
+    answer: |
+      `waf` becomes ngx_conf_enum_t {off=0, detect=1, enforce=2, on=2(alias)}. enable(ngx_flag_t) -> mode(ngx_uint_t).
+      Fail-CLOSED invariant (CWE-636): create-default=NGX_CONF_UNSET_UINT, merge default=WAF_MODE_ENFORCE.
+      detect is the ONLY non-blocking value; any unexpected value takes the blocking path. `waf on` still enforces.
+    details:
+      - "ALL 7 conversion sites must change (4 HTTP + 3 STREAM) or it fails to compile / silently mis-gates."
+      - "A missed conversion site MUST fail CLOSED (block), never observe-only."
+    options: []
+    status: answered
+  - category: security
+    question: "Method-block response code and policy disclosure?"
+    answer: "Fixed 404 (consistent with scanner blocks, hides the method policy). No configurable action token."
+    details: ["whitelist (waf_method_allow) wins, then blacklist (waf_method_deny) narrows."]
+    options: ["403", "404", "405", "configurable"]
+    status: answered
+  - category: security
+    question: "location.db cron supply-chain integrity?"
+    answer: |
+      MANDATORY (security review): magic-only validation is integrity-theater. Fetch over HTTPS with cert
+      verification (fixed constant URL, never interpolated) AND verify IPFire's published signature (GPG detached
+      sig OR pinned SHA256 from a separately-fetched signed manifest) BEFORE the swap. libloc magic/version is a
+      sanity check, NOT the integrity control. TOCTOU-safe (CWE-367): temp file in target dir, verify-in-place,
+      rename() same file, no re-download. Least privilege: non-root owner that can signal nginx master for reload.
+    details:
+      - "CWE-494/345 (download integrity), CWE-367 (TOCTOU), least-privilege."
+      - "Implementation must confirm IPFire's actual signing mechanism for location.db (GPG sig vs SHA256 manifest)."
+    options: []
+    status: answered
+  - category: implementation
+    question: "JA4 string lifetime / ownership?"
+    answer: |
+      Option (b): allocate the JA4 string from the connection pool c->pool (reachable via
+      SSL_get_ex_data(ssl, ngx_ssl_connection_index)), freed with the connection pool. No manual free,
+      matches nginx allocation discipline; getter returns a pointer valid for the request lifetime.
+      SSL_client_hello_get1_extensions_present() *out is the ONLY allocating getter -> OPENSSL_free on EVERY path (CWE-401).
+    details: []
+    options: ["OPENSSL_malloc + ex_data free-cb", "c->pool (connection-scoped)"]
+    status: answered
+
+constraints:
+  - type: technical
+    description: "Vanilla nginx 1.30.2 dynamic module; bundled OpenSSL 3.5.7 (system 3.0.2 too old for QUIC)."
+    impact: "No nginx/OpenSSL source patching. QUIC features require the bundled OpenSSL."
+  - type: technical
+    description: "STREAM TU (waf_stream.c) includes ONLY waf_rep.h (ngx_core-only). Verified: includes ngx_config/ngx_core/ngx_stream/waf_rep.h."
+    impact: "STREAM cannot see ngx_http_waf_stat_shm_t -> detect path pokes stream_would_block[] via opaque void* helper ngx_http_waf_stat_stream_would_block (mirrors ngx_http_waf_stat_stream_bump, waf_rep.h:120-121, def ngx_http_waf_module.c:377-390). JA4 + method are HTTP-only."
+  - type: technical
+    description: "Build: CMake super-build broken for modules (PATH bug). NGX=build/nginx_ext-prefix/src/nginx_ext."
+    impact: "New .c/config -> re-run ./configure + `touch $SSL_H` (OpenSSL-rebuild trap) before `make -C $NGX modules` with PATH=/usr/bin:/bin. New .so -> nginx stop+start. All builds via p:minion-builder. No project-forge.yaml present. Docker strictly forbidden."
+  - type: technical
+    description: "No C unit-test infrastructure in the module (tests/ has only run-stat-tests.sh + waf-stat-test.conf); no ctest.h in repo; scripts/ dir does not exist."
+    impact: "JA4 unit test = standalone cc build + vendored single-header ctest.h. scripts/ must be created for the cron script."
+  - type: security
+    description: "JA4 parser processes attacker-controlled ClientHello bytes."
+    impact: "Bounds-safety MANDATORY: count clamp WAF_JA4_MAX_ELEMS (CWE-190), bounded heap/pool copy before sort with clamped count (CWE-787), fixed output buffer (36 bytes + NUL), every read bounded by getter-returned length (CWE-125), ALPN hex-fallback as injection-safety control (CWE-116/117), get1_extensions_present leak discipline (CWE-401), fail-open never crash."
+  - type: technical
+    description: "Wrapper cb NULL-deref hazard (inspector C2): nginx ngx_ssl_client_hello_callback unconditionally derefs cb->servername (ngx_event_openssl.c:2063) from SSL_CTX_get_ex_data(...,ngx_ssl_client_hello_arg_index) (:2025-2026)."
+    impact: "Wrapper MUST: arg = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn), ngx_ssl_client_hello_arg_index); if NULL -> return SSL_CLIENT_HELLO_SUCCESS (skip chain); else chain ngx_ssl_client_hello_callback(ssl_conn, ad, NULL). Install only where sscf->ssl.ctx!=NULL AND arg ex_data already set. WAF postconfig must run AFTER ngx_http_ssl_module merge (it does, add-dynamic-module load order)."
+
+success_criteria:
+  - "$waf_ja4_hash produces a correct FoxIO JA4 (a_b_c) for TCP-TLS, validated bit-for-bit against Wireshark for >=1 known client."
+  - "$waf_ja4_hash produces a q...-prefixed JA4 for HTTP/3 (QUIC) — empirical confirmation the wrapped cb fires on QUIC."
+  - "SNI virtual hosts + certificate selection keep working after the JA4 wrapper is installed (no regression)."
+  - "waf_asn_block 64500 64501; blocks requests/connections resolving to those ASNs; non-listed and asn==0 pass."
+  - "$waf_asn shows the source ASN in the access log."
+  - "waf_method_allow GET POST HEAD; returns 404 for any other method; waf_method_deny TRACE TRACK; returns 404 for those two."
+  - "waf detect; lets all requests through (NGX_DECLINED) while would_block[reason] increments exactly as enforce-mode blocked counters would."
+  - "waf on; still parses and behaves as enforce (backward compatibility)."
+  - "Stats endpoints (plain/json/prometheus) expose the new asn/method reasons and the would_block counters."
+  - "JA4 unit test asserts the FoxIO canonical vector t13d1516h2_8daaf6152771_e5627efa2ab1 (pure-core build fn)."
+  - "The cron script atomically replaces location.db only after HTTPS+signature validation, and reloads nginx."
+  - "Build clean under -Werror -W -Wall; curl integration harness passes (existing + new assertions); JA4 unit test passes."
+
+context_summary:
+  error_handling: |
+    Internal fns return ngx_int_t NGX_OK/NGX_ERROR; config handlers return NGX_CONF_OK/NGX_CONF_ERROR.
+    reputation_check NULL-guards `out` on every branch. JA4 + ASN are FAIL-OPEN (asn==0 -> pass; JA4
+    compute failure -> still chain to nginx cb + return SSL_CLIENT_HELLO_SUCCESS, never break handshake).
+    Method filter only acts when its directive is configured.
+  memory_management: |
+    Config arrays from cf->pool (reload-safe); lazy ngx_array_create (8 elems, sizeof(uint16_t)).
+    Per-connection JA4 string from c->pool (via SSL_get_ex_data(ssl, ngx_ssl_connection_index)), freed with conn.
+    SSL_client_hello_get1_extensions_present() *out is the ONLY allocating getter -> OPENSSL_free on EVERY path
+    (single goto cleanup). Sort scratch = heap/pool copy sized clamped_count*sizeof(uint16_t), freed on every path.
+  logging_pattern: "ngx_log_error(NGX_LOG_INFO/NGX_LOG_WARN/NGX_LOG_ERR, log, 0, fmt, ...); block events at INFO."
+  naming_conventions: |
+    ngx_http_waf_ prefix, snake_case functions, UPPER_CASE macros/enums. WAF_REASON_* enum, WAF_MODE_* macros.
+    Reason tokens are lowercase strings in waf_reason_str[] (e.g. "asn", "method"). uint16_t packing for cc codes.
+  key_patterns:
+    - "Reason-indexed arrays are [WAF_REASON_MAX]; all 3 serializers loop `for (i=WAF_REASON_NONE+1; i<WAF_REASON_MAX; i++)` -> new reasons auto-render; would_block[] needs EXPLICIT rows."
+    - "Directive set-handlers iterate cf->args->elts[1..nelts), call an array-add helper writing to wlcf->rep.<arr> (see ngx_http_waf_set_geo_block + ngx_http_waf_country_add)."
+    - "Lazy variable getters: get-or-alloc ctx; do work once behind a *_done bit; cache; set v->valid/no_cacheable/not_found (see ngx_http_waf_country_variable:1088)."
+    - "STREAM TU sees ONLY waf_rep.h; pokes shm via opaque void* helpers (ngx_http_waf_stat_stream_bump pattern)."
+    - "mode refactor: hit ALL 7 sites; create-default=NGX_CONF_UNSET_UINT, merge=ngx_conf_merge_uint_value(...,WAF_MODE_ENFORCE); a missed site MUST fail CLOSED."
+    - "JA4 hook code inside #ifdef SSL_CLIENT_HELLO_SUCCESS; wrapper NULL-guards cb arg ex_data before chaining."
+    - "GREASE filter: (v & 0x0f0f) == 0x0a0a -> drop from ciphers/exts/sigalgs (count + hash)."
+
+implementation_plan:
+  total_effort: xl
+  effort_breakdown:
+    ss: 1
+    s: 3
+    m: 9
+    l: 5
+    xl: 0
+    xxl: 0
+  affected_files:
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf.h
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.h
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/waf-stat-test.conf
+    - /mnt/nvme/imaginarium/openresty/README.md
+  new_files:
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_ja4.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_ja4.h
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/unit/test-ja4.c
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/unit/ctest.h
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/unit/run-unit-tests.sh
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/scripts/update-location-db.sh
+  reference_files:
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c        # country_add helper, geo decision branch
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c   # directives, set-handlers, getters, stat_stream_bump, preaccess
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c            # 3 serializers, reason loops
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c            # STREAM directive + enable reads + opaque shm bump
+    - /mnt/nvme/imaginarium/openresty/build/nginx_ext-prefix/src/nginx_ext/src/event/ngx_event_openssl.c  # client_hello_cb chain + cb->servername deref
+    - /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh     # integration harness pattern
+
+  tasks:
+    # ============================ GROUP A — shared enum/stats (build together) ============================
+    - task_id: task-001
+      description: "Extend waf_rep.h: +2 reasons, WAF_MODE_* macros, verdict.asn, rep_conf.block_asn array, stream_would_block decl"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
+      function_name: null
+      type: modify
+      status: completed
+      size: s
+      size_rationale: "~12 lines across enum, 3 macros, 1 struct field, 1 array field, 1 fwd decl — all header edits"
+      implementation_details: |
+        1. Add WAF_REASON_ASN and WAF_REASON_METHOD immediately BEFORE WAF_REASON_MAX (currently :53),
+           keeping existing indices stable. WAF_REASON_MAX shifts to :55.
+        2. Add macros (visible to both HTTP + STREAM TUs): WAF_MODE_OFF=0, WAF_MODE_DETECT=1, WAF_MODE_ENFORCE=2.
+        3. Add `uint32_t asn;` to ngx_http_waf_verdict_t after `flags` (after :67, before geo_valid bitfield).
+        4. Add `ngx_array_t *block_asn;` to ngx_waf_rep_conf_t (same struct that holds block_cc; uint32 entries).
+        5. Declare the STREAM-safe opaque helper:
+           void ngx_http_waf_stat_stream_would_block(void *shm, ngx_http_waf_reason_e reason);
+           (place next to the existing ngx_http_waf_stat_stream_bump decl at :120-121).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
+          function: null
+          note: "Current enum (verified :43-54) — append before WAF_REASON_MAX"
+          pattern_excerpt: |
+            typedef enum {
+                WAF_REASON_NONE = 0,
+                WAF_REASON_ALLOWLIST,
+                WAF_REASON_BLOCKLIST,
+                WAF_REASON_GEO,
+                WAF_REASON_GEO_WHITELIST,
+                WAF_REASON_FLAG,
+                WAF_REASON_SCANNER_UA,
+                WAF_REASON_EMPTY_UA,
+                WAF_REASON_SCANNER_PATH,
+                /* WAF_REASON_ASN,    <- NEW (index 9) */
+                /* WAF_REASON_METHOD, <- NEW (index 10) */
+                WAF_REASON_MAX
+            } ngx_http_waf_reason_e;
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_rep.h
+          function: ngx_http_waf_stat_stream_bump
+          note: "Sibling opaque helper decl to mirror (verified :120-121); use ngx_http_waf_reason_e for the reason param"
+          pattern_excerpt: |
+            void ngx_http_waf_stat_stream_bump(void *shm, ngx_http_waf_reason_e reason,
+                ngx_uint_t denied);
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Compiles; WAF_REASON_MAX==11; WAF_MODE_* values 0/1/2; verdict struct has asn field."
+      dependencies: []
+
+    - task_id: task-002
+      description: "Add asn/method strings to waf_reason_str[] table"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: null
+      type: modify
+      status: completed
+      size: ss
+      size_rationale: "2 entries appended to existing table"
+      implementation_details: |
+        Append ngx_string("asn") (index 9) and ngx_string("method") (index 10) to waf_reason_str[]
+        (verified :43-53), matching the enum positions from task-001.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: null
+          note: "Verified table :43-53 (9 entries today)"
+          pattern_excerpt: |
+            ngx_str_t  waf_reason_str[WAF_REASON_MAX] = {
+                ngx_string("none"),           /* [0] */
+                ngx_string("allowlist"),      /* [1] */
+                ngx_string("blocklist"),      /* [2] */
+                ngx_string("geo"),            /* [3] */
+                ngx_string("geo_whitelist"),  /* [4] */
+                ngx_string("flag"),           /* [5] */
+                ngx_string("scanner_ua"),     /* [6] */
+                ngx_string("empty_ua"),       /* [7] */
+                ngx_string("scanner_path")    /* [8] */
+                /* ngx_string("asn"),     [9]  NEW */
+                /* ngx_string("method")   [10] NEW */
+            };
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Stats endpoints render `asn`/`method` tokens for the new reasons; no index mismatch."
+      dependencies: [task-001]
+
+    - task_id: task-003
+      description: "waf three-state enum (off|detect|enforce|on), enable->mode refactor (4 HTTP sites), detect-aware finalize helper"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_finalize_decision
+      type: modify
+      status: completed
+      size: l
+      size_rationale: "Keystone: enum table + command rewrite + 4 conversion sites + new finalize helper wired at every HTTP block point; mode field in loc_conf header; ~120 lines, high regression surface"
+      implementation_details: |
+        A. ngx_http_waf.h: change loc_conf `enable` (ngx_flag_t, :65) -> `mode` (ngx_uint_t).
+        B. Add `static ngx_conf_enum_t ngx_http_waf_mode[]` {off=0, detect=1, enforce=2, on=2(alias), null}.
+        C. Rewrite the `waf` command (verified :107-112) from ngx_conf_set_flag_slot/offsetof(enable) to
+           ngx_conf_set_enum_slot / offsetof(mode) / &ngx_http_waf_mode (keep TAKE1, same conf scopes).
+        D. Convert ALL 4 HTTP enable sites (verified):
+           - create-default :649  conf->enable=NGX_CONF_UNSET  -> conf->mode=NGX_CONF_UNSET_UINT
+           - merge        :663  ngx_conf_merge_value(...,0) -> ngx_conf_merge_uint_value(conf->mode,prev->mode,WAF_MODE_ENFORCE)
+           - POST_READ    :288  if(!wlcf->enable) -> if(wlcf->mode==WAF_MODE_OFF)
+           - preaccess    :479  if(!wlcf->enable) -> if(wlcf->mode==WAF_MODE_OFF)
+        E. Add ngx_http_waf_finalize_decision(r, ctx, wlcf, reason, block_code): if mode==WAF_MODE_DETECT ->
+           bump shm http_would_block[reason] + return NGX_DECLINED; else bump http_blocked[reason] (mirror the
+           existing block counter bump + INFO log) + return block_code. Route EVERY HTTP block point through it.
+        FAIL-CLOSED: detect is the ONLY non-blocking branch; any other mode value blocks.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: null
+          note: "Current waf command to replace (verified :107-112)"
+          pattern_excerpt: |
+            { ngx_string("waf"),
+              NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+              ngx_conf_set_flag_slot,
+              NGX_HTTP_LOC_CONF_OFFSET,
+              offsetof(ngx_http_waf_loc_conf_t, enable),
+              NULL },
+            /* -> ngx_conf_set_enum_slot, offsetof(...,mode), &ngx_http_waf_mode; enum {off,detect,enforce,on=alias} */
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: ngx_http_waf_stat_stream_bump
+          note: "Existing block-counter bump discipline to mirror in the finalize helper (def :377-390)"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "`waf on`/`waf enforce`/`waf detect`/`waf off` all parse; omitted waf -> enforce; detect -> NGX_DECLINED + would_block bump; -Werror clean (no missed enable site)."
+      dependencies: [task-001]
+
+    - task_id: task-004
+      description: "ASN: ngx_http_waf_asn_add helper + decision branch in reputation_check + out->asn copy"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
+      function_name: ngx_http_waf_reputation_check
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "New decimal-uint32 array-add helper (~25 lines) + decision branch + unconditional out->asn copy"
+      implementation_details: |
+        1. ngx_http_waf_asn_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *val): parse decimal uint32
+           (reject non-numeric at config time), lazy ngx_array_create(cf->pool, 8, sizeof(uint32_t)), push.
+           Mirror ngx_http_waf_country_add structure (verified :185-214).
+        2. In reputation_check, after the flag block (~:107, before CC): always copy out->asn = res.asn
+           (for $waf_asn). Then if res.asn != 0 AND res.asn in rep->block_asn -> set reason=WAF_REASON_ASN,
+           write reason str "asn", return the block verdict (NULL-guard out as every other branch does).
+           asn==0 -> fail-open (no block).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_reputation.c
+          function: ngx_http_waf_country_add
+          note: "Array-add template (verified :185-214) — adapt 2-char-cc to decimal uint32"
+          pattern_excerpt: |
+            ngx_int_t
+            ngx_http_waf_country_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *cc)
+            {
+                uint16_t  *code;
+                if (cc->len != 2) { ngx_conf_log_error(...); return NGX_ERROR; }
+                if (*arr == NULL) {
+                    *arr = ngx_array_create(cf->pool, 8, sizeof(uint16_t));
+                    if (*arr == NULL) return NGX_ERROR;
+                }
+                code = ngx_array_push(*arr);
+                if (code == NULL) return NGX_ERROR;
+                *code = (uint16_t)((ngx_toupper(cc->data[0])<<8)|ngx_toupper(cc->data[1]));
+                return NGX_OK;
+            }
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.h
+          function: null
+          note: "geo_result.asn already present (verified :57); filled at waf_geo.c:254"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "waf_asn_block 64500; blocks IP resolving to AS64500; AS64501 + asn==0 pass; non-numeric arg -> config error."
+      dependencies: [task-001]
+
+    - task_id: task-005
+      description: "waf_asn_block directive + set-handler (HTTP)"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_set_asn_block
+      type: modify
+      status: completed
+      size: s
+      size_rationale: "1 command entry + 1 set-handler iterating args, mirrors geo_block exactly"
+      implementation_details: |
+        Add `waf_asn_block` command (NGX_CONF_1MORE, same scopes as geo_block) near :171.
+        Add set-handler near ngx_http_waf_set_geo_block (:826) iterating cf->args[1..n] -> ngx_http_waf_asn_add(cf, &wlcf->rep.block_asn, &value[i]).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: ngx_http_waf_set_geo_block
+          note: "Directive + set-handler template (verified command :171-176, handler :826-841)"
+          pattern_excerpt: |
+            { ngx_string("waf_geo_block"),
+              NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+              ngx_http_waf_set_geo_block, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+            /* handler: */
+            static char *
+            ngx_http_waf_set_geo_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+                ngx_http_waf_loc_conf_t *wlcf = conf;
+                ngx_str_t *value = cf->args->elts; ngx_uint_t i;
+                for (i = 1; i < cf->args->nelts; i++)
+                    if (ngx_http_waf_country_add(cf, &wlcf->rep.block_cc, &value[i]) != NGX_OK)
+                        return NGX_CONF_ERROR;
+                return NGX_CONF_OK;
+            }
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "`waf_asn_block 64500 64501;` parses; populates rep.block_asn with 2 entries."
+      dependencies: [task-004]
+
+    - task_id: task-006
+      description: "$waf_asn lazy variable getter + ctx asn fields + preconf registration"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_asn_variable
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "ctx fields (header) + getter (~40 lines mirroring country_variable) + registration entry"
+      implementation_details: |
+        1. ngx_http_waf.h ctx: add `unsigned asn_done:1;` and `uint32_t asn;` after `reason` (:103).
+        2. Register $waf_asn in ngx_http_waf_preconfiguration (:1015-1042) alongside $waf_country.
+        3. ngx_http_waf_asn_variable getter: mirror ngx_http_waf_country_variable (:1088). Get-or-alloc ctx;
+           if !asn_done -> geo_lookup (reuse ctx->geo_done logic / same lookup) -> ctx->asn=res.asn; asn_done=1.
+           If ctx->asn==0 -> not_found; else format decimal into a small ngx_pnalloc buffer (max 10 digits),
+           set v->len/data/valid/no_cacheable.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: ngx_http_waf_country_variable
+          note: "Lazy getter template (verified static, :1088); $waf_asn mirrors it but formats decimal uint32"
+          pattern_excerpt: |
+            ctx = ngx_http_get_module_ctx(r, ngx_http_waf_module);
+            if (ctx == NULL) { ctx = ngx_pcalloc(...); ngx_http_set_ctx(...); }
+            if (!ctx->geo_done) {
+                wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+                if (wlcf->rep.geo_db != NULL) {
+                    sa = ctx->client_sa ? ctx->client_sa : r->connection->sockaddr;
+                    ngx_http_waf_geo_lookup(wlcf->rep.geo_db, sa, &res);
+                    if (res.found) { ctx->country[0]=res.country[0]; ctx->country[1]=res.country[1]; }
+                }
+                ctx->geo_done = 1;
+            }
+            if (ctx->country[0]==0) { v->valid=0; v->no_cacheable=1; v->not_found=1; return NGX_OK; }
+            v->len=2; v->data=ctx->country; v->valid=1; v->no_cacheable=1; v->not_found=0;
+            return NGX_OK;
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "$waf_asn shows decimal ASN in access log; not_found when asn==0 / no geo db."
+      dependencies: [task-001]
+
+    - task_id: task-007
+      description: "HTTP method filter: loc_conf fields, waf_method_allow/deny directives + set-handlers, allowed/denied helpers, preaccess wiring -> 404"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_method_allowed
+      type: modify
+      status: completed
+      size: l
+      size_rationale: "loc_conf fields + 2 directives + 2 set-handlers (name->bit mapping + non-standard string list) + 2 check helpers + preaccess insertion; ~150 lines"
+      implementation_details: |
+        1. ngx_http_waf.h loc_conf: add method_allow_set:1, method_deny_set:1, ngx_uint_t allow_mask, deny_mask,
+           ngx_array_t *allow_list, *deny_list (non-standard method names as ngx_str_t).
+        2. Directives waf_method_allow / waf_method_deny (NGX_CONF_1MORE). Set-handlers map standard names to
+           NGX_HTTP_* bits (GET/HEAD/POST/PUT/DELETE/MKCOL/COPY/MOVE/OPTIONS/PROPFIND/PROPPATCH/LOCK/UNLOCK/PATCH/TRACE);
+           unknown names (TRACK/DEBUG) go to the string list. Set the *_set flag.
+        3. Helpers: ngx_http_waf_method_allowed(wlcf, r) -> r->method & allow_mask, or r->method_name in allow_list;
+           ngx_http_waf_method_denied(wlcf, r) -> r->method & deny_mask, or r->method_name in deny_list.
+        4. Preaccess: insert BEFORE UA classify (verified :552). Whitelist wins then blacklist narrows:
+             if (method_allow_set && !allowed) -> finalize_decision(..., WAF_REASON_METHOD, NGX_HTTP_NOT_FOUND);
+             if (method_deny_set && denied)     -> finalize_decision(..., WAF_REASON_METHOD, NGX_HTTP_NOT_FOUND);
+           Goes through the detect-aware finalize (task-003) so detect mode bumps would_block + DECLINED.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: null
+          note: "Preaccess insertion point: reputation_check at :509, UA classify at :552 — method check goes between"
+          pattern_excerpt: |
+            /* ... ngx_http_waf_reputation_check(...) at :509 ... */
+            /* >>> INSERT method filter here (before :552) <<< */
+            /* method filter — whitelist wins, then blacklist narrows */
+            if (wlcf->method_allow_set && !ngx_http_waf_method_allowed(wlcf, r))
+                return ngx_http_waf_finalize_decision(r, ctx, wlcf, WAF_REASON_METHOD, NGX_HTTP_NOT_FOUND);
+            if (wlcf->method_deny_set && ngx_http_waf_method_denied(wlcf, r))
+                return ngx_http_waf_finalize_decision(r, ctx, wlcf, WAF_REASON_METHOD, NGX_HTTP_NOT_FOUND);
+            ngx_http_waf_ua_classify(r, wlcf, ctx);   /* :552 */
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "waf_method_allow GET POST HEAD -> PUT/DELETE/TRACE return 404; waf_method_deny TRACE TRACK -> 404, GET passes; detect mode -> 200 + would_block[method]++."
+      dependencies: [task-001, task-003]
+
+    - task_id: task-008
+      description: "Stats: http_would_block[]/stream_would_block[] arrays, opaque stream_would_block helper def, serializer rows (3 formats)"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
+      function_name: null
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "2 shm arrays + 1 opaque helper def + 3x explicit serializer row blocks mirroring http_blocked loops"
+      implementation_details: |
+        1. waf_status.h ngx_http_waf_stat_shm_t: add `ngx_atomic_t http_would_block[WAF_REASON_MAX];` after
+           http_resp_444 (:82) and `ngx_atomic_t stream_would_block[WAF_REASON_MAX];` after stream_denied[] (:89).
+        2. ngx_http_waf_module.c: define ngx_http_waf_stat_stream_would_block(void *shm, reason) mirroring
+           ngx_http_waf_stat_stream_bump (:377-390) — cast void* to shm, atomic-inc stream_would_block[reason].
+        3. waf_status.c: add EXPLICIT would_block serializer rows in all 3 formats, mirroring the http_blocked
+           reason loops (plain :202-244, json :344-387, prom :472-511). The new asn/method reasons render
+           automatically via the existing WAF_REASON_MAX loops; would_block needs its own rows.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_status.c
+          function: null
+          note: "Reason-loop pattern to mirror for would_block (plain http_blocked loop :202-206)"
+          pattern_excerpt: |
+            for (i = WAF_REASON_NONE + 1; i < WAF_REASON_MAX; i++) {
+                /* http_blocked[i] -> "<reason>: <count>" row */
+            }
+            /* add a parallel loop emitting http_would_block[i] / stream_would_block[i] */
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: ngx_http_waf_stat_stream_bump
+          note: "Opaque void* helper def template (verified :377-390)"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "All 3 formats expose http_would_block + stream_would_block per reason; asn/method reasons present in blocked loops; counter consistency across formats."
+      dependencies: [task-001]
+
+    - task_id: task-009
+      description: "STREAM: mode enum refactor (3 sites) + waf_asn_block stream directive + asn branch + detect via opaque helper"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
+      function_name: null
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "enum table + command rewrite + 3 conversion sites + asn directive/handler + detect branch via opaque helper; ngx_core-only boundary preserved"
+      implementation_details: |
+        1. Add ngx_conf_enum_t for stream mode (off/detect/enforce/on) + rewrite the waf_stream command
+           (verified :69-74) from flag_slot/enable to enum_slot/mode (offsetof on ngx_stream_waf_srv_conf_t.mode).
+        2. Convert ALL 3 STREAM enable sites (verified): handler :167 (!sscf->enable -> mode==WAF_MODE_OFF),
+           create-default :206 (NGX_CONF_UNSET_UINT), merge :218 (ngx_conf_merge_uint_value(...,WAF_MODE_ENFORCE)).
+        3. Add waf_asn_block stream directive + set-handler -> sscf->rep.block_asn via ngx_http_waf_asn_add.
+        4. STREAM detect path: where it would deny, if mode==WAF_MODE_DETECT call the opaque
+           ngx_http_waf_stat_stream_would_block(shm, reason) (decl waf_rep.h, def task-008) + return the
+           non-blocking code; else ngx_http_waf_stat_stream_bump + deny. STREAM has NO method/JA4 (HTTP-only).
+        Keep includes limited to ngx_config/ngx_core/ngx_stream/waf_rep.h (verified boundary).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
+          function: null
+          note: "Current stream command + enable reads to convert (verified cmd :69-74, reads :167/:206/:218)"
+          pattern_excerpt: |
+            { ngx_string("waf_stream"),
+              NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_FLAG,
+              ngx_conf_set_flag_slot, NGX_STREAM_SRV_CONF_OFFSET,
+              offsetof(ngx_stream_waf_srv_conf_t, enable), NULL },
+            /* :167 if(!sscf->enable)  :206 conf->enable=NGX_CONF_UNSET  :218 ngx_conf_merge_value(...,0) */
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_stream.c
+          function: null
+          note: "Existing opaque stat bump call (verified :178) — detect path mirrors with stream_would_block"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "STREAM waf_asn_block denies matching ASN; waf detect -> connection allowed + stream_would_block++; waf on enforces; -Werror clean (no missed enable site)."
+      dependencies: [task-001, task-008]
+
+    - task_id: task-010
+      description: "Extend integration harness with asn/method/detect/would_block assertions"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+      function_name: null
+      type: test
+      status: completed
+      size: m
+      size_rationale: "~6-8 new before/curl/after/assert_delta blocks + config additions in waf-stat-test.conf"
+      implementation_details: |
+        Add test cases following the getcnt/assert_delta pattern: waf_asn_block hit (synthetic geo entry or
+        documented skip), waf_method_allow -> 404 for disallowed, waf_method_deny -> 404, waf detect ->
+        request passes while would_block[reason] increments (assert via /waf/stat/plain), waf on enforces,
+        stats expose asn/method + would_block in all 3 formats. Update waf-stat-test.conf with new server
+        blocks (detect server, method-restricted location, asn-block location).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+          function: null
+          note: "Verified harness pattern: getcnt reads scalar from /waf/stat/plain via awk; assert_delta checks exact increment"
+          pattern_excerpt: |
+            getcnt() { curl -s "$STAT/waf/stat/plain" | awk -v k="$1" '$1==k{print $2}'; }
+            assert_delta() { # name before after want
+              local d=$(( $3 - $2 )); if [ "$d" = "$4" ]; then pass "$1"; else fail "$1 (got $d want $4)"; fi; }
+            before=$(getcnt blocked_method); curl -s -X PUT "$BASE/restricted"; after=$(getcnt blocked_method)
+            assert_delta "method 404" "$before" "$after" 1
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Harness exits 0; new asn/method/detect/would_block assertions pass. GROUP A build-clean (-Werror -W -Wall) via p:minion-builder, .so reload (stop+start) before running."
+      dependencies: [task-005, task-006, task-007, task-008, task-009]
+
+    # ============================ GROUP B — JA4 (large/risky) ============================
+    - task_id: task-011
+      description: "NEW waf_ja4.h + waf_ja4.c pure-core ngx_http_waf_ja4_build + JA4 constants + #ifndef WAF_JA4_UNIT_TEST skeleton + config registration"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_ja4.c
+      function_name: ngx_http_waf_ja4_build
+      type: create
+      status: completed
+      size: l
+      size_rationale: "Full JA4 algorithm (GREASE filter, clamp, sort, SHA256[:12]x2, a_b_c assembly, ALPN hex-fallback, version code) with mandatory bounds-safety; ~200 lines; pure/nginx-free core"
+      implementation_details: |
+        waf_ja4.h: WAF_JA4_LEN (37 = 36 + NUL), WAF_JA4_MAX_ELEMS (bound, e.g. 256), declarations of
+        ngx_http_waf_ja4_build (pure), ngx_http_waf_ja4_compute (SSL wrapper, decl), ngx_http_waf_ja4_client_hello_cb.
+        waf_ja4.c skeleton: `#ifndef WAF_JA4_UNIT_TEST` guards all nginx includes + the SSL wrapper + cb; the
+        pure core compiles with only <stdint.h>,<string.h>,<stdio.h>,<openssl/sha.h>.
+        ngx_http_waf_ja4_build(ciphers,n_ciphers, exts,n_exts, sigalgs,n_sig, alpn,alpn_len, version, is_quic, out[WAF_JA4_LEN]):
+          - protocol char: is_quic ? 'q' : 't'; TLS version code from supported_versions (else legacy_version).
+          - GREASE filter (v&0x0f0f)==0x0a0a dropped from all 3 lists (count + hash).
+          - CWE-190: clamp each count to <=99 (2-digit) AND to WAF_JA4_MAX_ELEMS before any alloc.
+          - 'a' = <proto><ver><sni=d/i><nn ciphers><nn exts><alpn00>: ALPN first/last char, hex-fallback if not ASCII-alnum (CWE-116/117).
+          - CWE-787: sort a COPY (size clamped_count*sizeof(uint16_t)) — never in place; free on every path.
+          - 'b' = SHA256(sorted-cipher-hex-csv)[:12]; 'c' = SHA256(sorted-ext-hex-csv + "_" + sigalg-hex-csv)[:12]
+            (omit "_"+sigalgs if none). Fixed buffers + snprintf(buf,sizeof(buf),...) everywhere.
+        Register waf_ja4.c in modules/ngx_http_waf/config (append to waf_srcs :23-31; waf_ja4.h to waf_deps :14-21).
+        New .c requires ./configure re-run + touch $SSL_H before make modules.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/config
+          function: null
+          note: "Verified source lists — append waf_ja4.c / waf_ja4.h"
+          pattern_excerpt: |
+            waf_deps="...  ngx_http_waf.h waf_match.h waf_spoof.h waf_geo.h waf_rep.h \
+                      waf_reputation.h waf_authhttp.h waf_status.h"   # + waf_ja4.h
+            waf_srcs="...  ngx_http_waf_module.c waf_match.c waf_spoof.c waf_geo.c \
+                      waf_reputation.c waf_authhttp.c waf_stream.c waf_status.c"  # + waf_ja4.c
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Pure core compiles standalone (cc -DWAF_JA4_UNIT_TEST -lcrypto); produces FoxIO vector in task-012; full module builds clean after config + configure + make modules."
+      dependencies: []
+
+    - task_id: task-012
+      description: "NEW tests/unit JA4 scaffold: vendor ctest.h + test-ja4.c + run-unit-tests.sh"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/unit/test-ja4.c
+      function_name: null
+      type: test
+      status: completed
+      size: m
+      size_rationale: "New test dir + vendored single-header ctest.h + ~80-line test file (5 cases) + compile/run driver"
+      implementation_details: |
+        1. Create tests/unit/ and vendor a single-header ctest.h (NOT present in repo; see p:ctest.h skill).
+        2. test-ja4.c: `#define WAF_JA4_UNIT_TEST` then `#include "../../src/waf_ja4.c"` (pulls only the pure core),
+           `#include "ctest.h"`. Test cases:
+             - FoxIO canonical vector: feed the documented cipher/ext/sigalg set -> ASSERT exact
+               "t13d1516h2_8daaf6152771_e5627efa2ab1".
+             - GREASE filtering (0x0a0a, 0x1a1a, ... dropped from count + hash).
+             - ALPN hex-fallback (non-alphanumeric first/last byte -> hex chars).
+             - empty sig-algs -> 'c' hash input omits the "_" + sigalg segment.
+             - oversized input (thousands of GREASE entries + zero-length) -> count clamp holds, no overflow.
+        3. run-unit-tests.sh: `cc -DWAF_JA4_UNIT_TEST -I../../src tests/unit/test-ja4.c -lcrypto -o /tmp/test-ja4 && /tmp/test-ja4`.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+          function: null
+          note: "Existing test driver style (bash pass/fail) to mirror for run-unit-tests.sh"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Unit binary builds with cc -DWAF_JA4_UNIT_TEST -lcrypto; all 5 cases pass; FoxIO vector matches bit-for-bit."
+      dependencies: [task-011]
+
+    - task_id: task-013
+      description: "ctx ja4 fields + $waf_ja4_hash lazy getter + preconf registration + global ja4 SSL ex-index var"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_ja4_variable
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "ctx fields (header) + global int index + getter (~35 lines) with SSL-deref guard + registration"
+      implementation_details: |
+        1. ngx_http_waf.h ctx: add `unsigned ja4_done:1;` and `ngx_str_t ja4;` after the asn fields (:103).
+        2. Module-level `static int ngx_http_waf_ja4_ssl_index = -1;` (created via SSL_get_ex_new_index in task-015).
+        3. Register $waf_ja4_hash in preconfiguration (:1015-1042).
+        4. ngx_http_waf_ja4_variable getter: null-check r->connection->ssl FIRST, then ssl->connection (SSL*),
+           then SSL_get_ex_data(ssl, ngx_http_waf_ja4_ssl_index). If no SSL or no stored JA4 -> not_found.
+           Otherwise surface the cached string (computed at handshake in the cb; NO lazy compute — raw ClientHello is gone).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: ngx_http_waf_country_variable
+          note: "Getter scaffold (verified :1088); JA4 differs: reads SSL ex_data, no geo lookup"
+          pattern_excerpt: |
+            /* JA4 getter — guard the SSL* deref FIRST */
+            if (r->connection->ssl == NULL) { v->valid=0; v->not_found=1; v->no_cacheable=1; return NGX_OK; }
+            SSL *ssl = r->connection->ssl->connection;
+            ngx_str_t *j = SSL_get_ex_data(ssl, ngx_http_waf_ja4_ssl_index);
+            if (j == NULL || j->len == 0) { v->valid=0; v->not_found=1; v->no_cacheable=1; return NGX_OK; }
+            v->len = j->len; v->data = j->data; v->valid=1; v->no_cacheable=1; v->not_found=0;
+            return NGX_OK;
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "$waf_ja4_hash not_found on plain HTTP / no SSL; surfaces cached string when set by cb."
+      dependencies: [task-011]
+
+    - task_id: task-014
+      description: "ngx_http_waf_ja4_compute: SSL ClientHello getters -> ja4_build, get1_extensions_present leak discipline, get0_ext fallback, is_quic"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_ja4.c
+      function_name: ngx_http_waf_ja4_compute
+      type: modify
+      status: completed
+      size: l
+      size_rationale: "SSL getter extraction + MANDATORY OPENSSL_free-on-every-path leak discipline + get0_ext fallback for 3 critical extensions + alloc from c->pool; ~120 lines, security-critical"
+      implementation_details: |
+        Inside `#ifndef WAF_JA4_UNIT_TEST`. ngx_http_waf_ja4_compute(SSL *ssl, ngx_pool_t *pool, ngx_str_t *out):
+          - SSL_client_hello_get0_legacy_version, SSL_client_hello_get0_ciphers (-> uint16 array, bounded by returned len),
+            SSL_client_hello_get1_extensions_present (ALLOCATES *out -> OPENSSL_free on EVERY return path, single goto cleanup; CWE-401),
+            sig-algs + supported_versions + ALPN via SSL_client_hello_get0_ext(0x000d / 0x002b / 0x0010).
+          - If get1_extensions_present is incomplete on this OpenSSL build, fall back to explicit get0_ext reads
+            for 0x002b (supported_versions), 0x0010 (ALPN), 0x000d (sig-algs).
+          - is_quic = SSL_is_quic(ssl). Call ngx_http_waf_ja4_build(...); copy the 36-byte result into a pool buffer.
+          - Fail-open: malformed/zero-length -> return NGX_ERROR (no JA4), never crash.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_ja4.c
+          function: ngx_http_waf_ja4_build
+          note: "The pure core this wrapper feeds (from task-011)"
+          pattern_excerpt: |
+            int *exts = NULL; size_t n_ext = 0;
+            if (SSL_client_hello_get1_extensions_present(ssl, &exts, &n_ext) != 1) { goto cleanup; }
+            /* ... build cipher/sigalg/alpn arrays bounded by getter lengths ... */
+            rc = ngx_http_waf_ja4_build(ciphers,n_cip, ext16,n_ext, sig16,n_sig, alpn,alpn_len, ver, is_quic, buf);
+            cleanup:
+            if (exts) OPENSSL_free(exts);   /* MANDATORY on every path */
+            return rc;
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "ASAN/valgrind a few thousand handshakes -> no per-connection leak on any parser path; malformed ClientHello -> fail-open, no crash."
+      dependencies: [task-011]
+
+    - task_id: task-015
+      description: "Wrapper cb + SSL ex-index alloc + postconfig SSL_CTX walk + NULL-guard chain + ordering"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+      function_name: ngx_http_waf_ja4_client_hello_cb
+      type: modify
+      status: completed
+      size: l
+      size_rationale: "ex-index alloc + cb (compute + store + NULL-guarded chain) + postconfig cmcf->servers walk + ngx_http_ssl_module.h include + #ifdef guard; ~130 lines, CRITICAL handshake-crash risk"
+      implementation_details: |
+        Inside `#ifdef SSL_CLIENT_HELLO_SUCCESS` (matches the nginx decl guard; DRIFT: ngx_event_openssl.h:298).
+        1. #include "ngx_http_ssl_module.h" (ngx_http_ssl_srv_conf_t.ssl :18, extern ngx_http_ssl_module :72).
+        2. ngx_http_waf_ja4_ssl_index = SSL_get_ex_new_index(...) once at module init/postconfig.
+        3. ngx_http_waf_ja4_client_hello_cb(ssl_conn, ad, arg):
+             - c = SSL_get_ex_data(ssl_conn, ngx_ssl_connection_index); ja4_compute(ssl_conn, c->pool, &ja4);
+               on success SSL_set_ex_data(ssl_conn, ngx_http_waf_ja4_ssl_index, pooled copy). Failure -> fail-open.
+             - NULL-GUARD CHAIN (inspector C2): arg = SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl_conn),
+               ngx_ssl_client_hello_arg_index); if arg==NULL -> return SSL_CLIENT_HELLO_SUCCESS (DO NOT chain);
+               else return ngx_ssl_client_hello_callback(ssl_conn, ad, NULL). (Comment: at ClientHello time
+               session_ctx == SSL_get_SSL_CTX before any SNI cert-cb CTX switch.)
+        4. Postconfig walk: after the stats vhost-walk, iterate cmcf->servers -> sscf (via ngx_http_ssl_module
+           ctx_index) -> sscf->ssl.ctx; for each ctx with ctx!=NULL AND arg ex_data already set,
+           SSL_CTX_set_client_hello_cb(ctx, ngx_http_waf_ja4_client_hello_cb, NULL). Leave untouched otherwise.
+           WAF postconfig runs AFTER ngx_http_ssl_module merge (add-dynamic-module load order — verify).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/build/nginx_ext-prefix/src/nginx_ext/src/event/ngx_event_openssl.c
+          function: ngx_ssl_client_hello_callback
+          note: "Why the NULL-guard is mandatory: cb arg read :2025-2026, cb->servername deref :2063 (unconditional)"
+          pattern_excerpt: |
+            /* ngx_event_openssl.c :2025-2026 */
+            cb = SSL_CTX_get_ex_data(c->ssl->session_ctx, ngx_ssl_client_hello_arg_index);
+            /* ... :2063 (crashes if cb NULL) */
+            rc = cb->servername(ssl_conn, ad, &host);
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/ngx_http_waf_module.c
+          function: null
+          note: "Existing stats vhost-walk (~:1320-1323) is the template for the cmcf->servers -> sscf->ssl.ctx iteration"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Multi-vhost SNI test: cert selection + servername unaffected; ctx without arg ex_data not touched; no handshake crash."
+      dependencies: [task-013, task-014]
+
+    - task_id: task-016
+      description: "$waf_ja4_hash integration assertion in harness; GROUP B build-clean + TCP/Wireshark/QUIC gates"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+      function_name: null
+      type: test
+      status: completed
+      size: s
+      size_rationale: "1 TLS curl + format assertion; the Wireshark/QUIC gates are manual success-criteria checks"
+      implementation_details: |
+        Add an assertion that an HTTPS request yields a well-formed $waf_ja4_hash (regex /^t1[0-9a-z]/ for TCP,
+        logged via a test vhost). Manual gates (document in test_requirements, not auto): openssl s_client cipher
+        profiles vs Wireshark JA4 bit-for-bit; HTTP/3 request -> q... JA4; if get1_extensions_present incomplete,
+        confirm get0_ext fallback (0x002b/0x0010/0x000d).
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/tests/run-stat-tests.sh
+          function: null
+          note: "Harness pattern (getcnt/assert + curl); add a TLS log-field check"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "GROUP B build clean (-Werror -W -Wall) via p:minion-builder; .so stop+start; $waf_ja4_hash well-formed on TCP-TLS; Wireshark bit-for-bit match (manual); q... JA4 over HTTP/3 OR documented TCP-only fallback."
+      dependencies: [task-015]
+
+    # ============================ GROUP C — docs/script ============================
+    - task_id: task-017
+      description: "NEW scripts/update-location-db.sh cron script (download -> verify -> atomic swap -> reload)"
+      file_path: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/scripts/update-location-db.sh
+      function_name: null
+      type: create
+      status: cancel
+      size: m
+      size_rationale: "~60-line hardened shell script + scripts/ dir creation; supply-chain integrity logic"
+      implementation_details: |
+        Create scripts/ (does NOT exist). update-location-db.sh:
+          - Fixed constant HTTPS URL (never interpolated) with cert verification (curl --proto =https --tlsv1.2 -fsSL).
+          - Confirm IPFire's actual signing mechanism: verify published GPG detached signature OR pinned SHA256 from
+            a separately-fetched signed manifest BEFORE swap (CWE-494/345). libloc magic = sanity check only — state this.
+          - CWE-367 TOCTOU: download to a temp file IN the target directory (same fs); verify sig + magic in place;
+            rename() the SAME file; no re-download between verify and rename.
+          - Atomic replace -> `nginx -s reload`. Least privilege: run as non-root owner of the DB that can signal
+            nginx master (document; do NOT run the chain as root).
+          - Header comment documenting URL, validation steps, atomic swap, reload, zone-reset caveat.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/modules/ngx_http_waf/src/waf_geo.c
+          function: null
+          note: "waf_geo.c:110 checks only the libloc magic — explicitly NOT the integrity control; the script must add signature verification"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "Script verifies signature/magic before swap; temp file in target dir; atomic rename; reload signal; fails safe (keeps old DB) on any validation failure."
+      dependencies: []
+
+    - task_id: task-018
+      description: "README.md: new directives/variables + map-pattern config blocking + cron usage + stats sections"
+      file_path: /mnt/nvme/imaginarium/openresty/README.md
+      function_name: null
+      type: modify
+      status: completed
+      size: m
+      size_rationale: "Several new doc sections (~150 lines of markdown) across directives, variables, stats, map pattern, cron"
+      implementation_details: |
+        Document: `waf off|detect|enforce` (+ `on` alias, fail-closed default); waf_asn_block; waf_method_allow /
+        waf_method_deny (404 behavior); $waf_ja4_hash, $waf_asn; Statistics section (new asn/method reasons +
+        would_block counters, zone-reset-on-reload caveat); map-based config-level blocking pattern
+        (`map $waf_type $waf_deny { ... }` + `if ($waf_deny) return 403;`, NOT if-based on $waf_country/$waf_reason);
+        location.db cron usage + placement/schedule + zone-reset caveat.
+      code_references:
+        - file: /mnt/nvme/imaginarium/openresty/README.md
+          function: null
+          note: "Existing README (647 lines) — extend with new sections in the established style"
+      api_references: [docs/feature-implementation-plan.md]
+      test_requirements: "All new directives/variables/sections documented; map pattern example is valid nginx config; final directive/variable names match the implemented code."
+      dependencies: [task-003, task-005, task-007, task-015, task-017]

@@ -185,7 +185,7 @@ variable, independent of `waf` / `waf_bot_block`.
 
 | Directive | Args | Default | Purpose |
 |---|---|---|---|
-| `waf` | `on`\|`off` | `off` | Master switch for the HTTP `POST_READ` + `PREACCESS` handlers (reputation, UA block, scanner). Does **not** gate spoofing or `$waf_type` classification. |
+| `waf` | `off`\|`detect`\|`enforce` (alias `on`) | `enforce` | Mode for the HTTP `POST_READ` + `PREACCESS` handlers (reputation, UA block, scanner, method, ASN). `off` skips them; `enforce` (and the back-compat alias `on`) blocks; **`detect`** runs every check but **never blocks** — it lets the request through (`NGX_DECLINED`) and bumps the `would_block[reason]` counters instead, so you can size a policy before enforcing it. **Fail-closed (CWE-636):** an *unset* `waf` now defaults to **`enforce`** (it used to be `off`), and any value other than `off`/`detect` takes the blocking path. Does **not** gate spoofing or `$waf_type` classification. |
 | `waf_bot_block` | `on`\|`off` | `off` | Block only **hostile** User-Agents: `scanner` tools and empty/missing UA (→ 404). `crawler`/`ai-crawler`/`bot` are classified into `$waf_type` but **never** blocked by this flag. |
 | `waf_scanner_list` | `<path>` | — | Load scanner **path** patterns from a file (compiled into action buckets). |
 | `waf_scanner_ua_list` | `<path>` | — | UA signatures for security tools → `$waf_type=scanner`. |
@@ -195,6 +195,9 @@ variable, independent of `waf` / `waf_bot_block`.
 | `waf_server_token` | `<string>` | `Apache/2.4.68 (Unix)` | The fake `Server:` token and the error-page fingerprint. |
 | `waf_geo_db` | `<path>` | — | Path to the libloc `location.db` (mmap'd read-only). |
 | `waf_geo_block` | `<CC> …` | — | Block these country codes (ISO-3166 two-letter, plus IPFire specials A1/A2/A3/T1/XD) → 403. |
+| `waf_asn_block` | `<ASN> …` | — | Block these autonomous systems (decimal, 1..4294967295) when the client IP resolves to one via the geo DB → 403. `asn==0` / no record fails open. Repeatable / multi-arg. |
+| `waf_method_allow` | `<METHOD> …` | — | **Whitelist:** only the listed HTTP methods pass; every other method → 404. Standard methods (GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH, TRACE, the WebDAV verbs, …) map to nginx's method bits; non-standard names (e.g. TRACK) are matched verbatim. Wins over `waf_method_deny`. |
+| `waf_method_deny` | `<METHOD> …` | — | **Blacklist:** the listed methods → 404; everything else passes. (Note: `TRACE` is already rejected with 405 by nginx core before the WAF runs.) |
 | `waf_geo_whitelist` | `<CC> …` | — | **Allow only** these countries; every other country and any IP with no geo record → 404. Wins over `waf_geo_block`. Repeatable / multi-arg. |
 | `waf_flag_block` | `<flag> …` | — | Block by libloc network flag: `anonymous-proxy` (alias `anon`), `satellite`, `anycast`, `tor`, `drop`. |
 | `waf_trusted_proxy` | `<cidr>` | — | Trust `X-Forwarded-For` only from these peers when deriving the canonical client IP. |
@@ -309,13 +312,50 @@ all active):
 | Variable | Value |
 |---|---|
 | `$waf_country` | The client's ISO-3166 two-letter geo country (or an IPFire special A1/A2/A3/T1/XD). Resolves to *not found* (`-` in logs) when no geo record exists or `waf_geo_db` is unset. |
-| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`. |
+| `$waf_asn` | The client's autonomous-system number (decimal) from the geo DB. *Not found* (`-`) when `asn==0`, no record, or `waf_geo_db` is unset. Shares the per-request geo lookup, so it costs no extra DB hit. |
+| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`, `asn`, `method`. In `detect` mode it carries the *would-be* reason. |
+| `$waf_ja4_hash` | The [JA4](https://github.com/FoxIO-LLC/ja4) TLS client fingerprint (`t13d1516h2_…_…`), computed at the TLS handshake. **Observability only — never blocks.** *Not found* on plain HTTP / non-TLS. Works for TCP-TLS (HTTP/1.1, H2) and QUIC/H3 (the `q…` form). |
 
 ```nginx
 log_format waf '$remote_addr $status type=$waf_type '
-               'country=$waf_country reason=$waf_reason';
+               'country=$waf_country asn=$waf_asn reason=$waf_reason '
+               'ja4=$waf_ja4_hash';
 access_log /var/log/nginx/access.log waf;
 ```
+
+### Detect mode & config-level blocking
+
+`waf detect;` (and `waf_stream detect;`) runs every check but **lets the request
+through**, recording what it *would* have blocked in the `would_block[reason]`
+counters (see [Statistics](#statistics--status-endpoint)). Use it to size a new
+policy against live traffic before flipping to `enforce`:
+
+```nginx
+waf detect;            # observe only; nothing is blocked
+waf_geo_block CN RU;   # would-be 403s land in would_block[geo], not blocked[geo]
+```
+
+For blocking decisions the module itself does not make, drive them from the
+log variables at the **config** level with a `map` (cheaper and more flexible
+than chained `if`s). For example, deny by UA class and surface a would-be geo
+verdict without the built-in 403:
+
+```nginx
+# map the classification/verdict to a deny flag, then act on it once
+map $waf_type $waf_deny {
+    default      0;
+    scanner      1;
+    ai-crawler   1;          # block AI crawlers at the edge, say
+}
+
+server {
+    waf detect;              # the module observes; the map enforces
+    if ($waf_deny) { return 403; }
+}
+```
+
+Prefer a `map` over `if ($waf_country = CN)` chains: `map` is evaluated once,
+lazily, and composes cleanly with `$waf_asn` / `$waf_reason` / `$waf_ja4_hash`.
 
 ### Geo / reputation
 
@@ -336,7 +376,9 @@ the first deny wins):
    (`geo not whitelisted`).
 4. **geo network flag** match (`flag_mask`) → 403 (`network flag`). Applies in
    both block and whitelist modes.
-5. **geo country**:
+5. **ASN** match (`waf_asn_block`) → 403 (`asn`). `asn==0` / no record fails
+   open. Applies in both block and whitelist modes.
+6. **geo country**:
    - **block mode** (`waf_geo_block`): country in the block list → 403
      (`geo country`).
    - **whitelist mode** (`waf_geo_whitelist`, which *wins* when set): country
@@ -410,9 +452,10 @@ same reputation/geo semantics as the HTTP head:
 
 | Directive | Args | Purpose |
 |---|---|---|
-| `waf_stream` | `on`\|`off` | Master switch for the stream `ACCESS` handler (default `off`). |
+| `waf_stream` | `off`\|`detect`\|`enforce` (alias `on`) | Mode for the stream `ACCESS` handler. `detect` allows the connection but bumps `stream_would_block[reason]`. **Fail-closed:** unset defaults to `enforce`. |
 | `waf_geo_db` | `<path>` | libloc `location.db` for this stream head (mmap'd read-only). |
 | `waf_geo_block` | `<CC> …` | Block these countries → connection dropped. |
+| `waf_asn_block` | `<ASN> …` | Block these autonomous systems → connection dropped. |
 | `waf_geo_whitelist` | `<CC> …` | Allow only these countries (and known IPs); else dropped. Wins over `waf_geo_block`. |
 | `waf_flag_block` | `<flag> …` | Block by libloc network flag (`anycast`, `anonymous-proxy`, …). |
 | `waf_blocklist` | `<cidr>` | Statically deny this network. Repeatable. |
@@ -479,13 +522,17 @@ waf_country_blocked_total{country="CN"} 904
 ```
 
 What is tracked: global HTTP verdict counters (requests / allowed / allowlist
-hits / blocked-per-reason), the scanner-path 404/403/444 split, response-code
+hits / blocked-per-reason), the **`would_block`-per-reason** counters bumped by
+`detect` mode (`http_would_block_*` / `waf_http_would_block_total{reason=…}`),
+the scanner-path 404/403/444 split, response-code
 counters, the `$waf_type` UA distribution, the per-flag breakdown, a bounded
 open-addressed **per-country** table (total + blocked, with a `cc_overflow`
 guard), a **per-vhost** block breakdown (labelled by `server_name`), the STREAM
 (L4) globals (`stream_connections_total` / `stream_allowed` /
-`stream_denied`-per-reason), and a geo-DB health block (network count + mapped
-size only — **never** the database path). When nginx is built with
+`stream_denied`-per-reason, plus `stream_would_block`-per-reason), and a geo-DB
+health block (network count + mapped size only — **never** the database path).
+The `asn` and `method` reasons render automatically in every per-reason loop
+(blocked, would_block, per-vhost) across all three formats. When nginx is built with
 `--with-http_stub_status_module`, the core connection table
 (`active`/`reading`/`writing`/`accepted`/…) is re-exported too.
 

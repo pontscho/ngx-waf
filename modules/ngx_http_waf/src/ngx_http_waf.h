@@ -62,7 +62,7 @@ typedef enum {
  * with respect to each other.
  */
 typedef struct {
-    ngx_flag_t                     enable;       /* waf on|off            */
+    ngx_uint_t                     mode;         /* waf off|detect|enforce|on */
     ngx_flag_t                     bot_block;    /* waf_bot_block on|off  */
 
     ngx_str_t                      scanner_list; /* waf_scanner_list path */
@@ -75,6 +75,14 @@ typedef struct {
 
     ngx_waf_rep_conf_t             rep;          /* geo / CC / flags / CIDRs */
     ngx_array_t                   *trusted_proxy;/* ngx_cidr_t for XFF (HTTP) */
+
+    /* HTTP method filter (waf_method_allow / waf_method_deny -> 404) */
+    unsigned                       method_allow_set:1; /* whitelist configured */
+    unsigned                       method_deny_set:1;  /* blacklist configured */
+    ngx_uint_t                     allow_mask;   /* NGX_HTTP_* bits, whitelist */
+    ngx_uint_t                     deny_mask;    /* NGX_HTTP_* bits, blacklist */
+    ngx_array_t                   *allow_list;   /* non-standard names (ngx_str_t) */
+    ngx_array_t                   *deny_list;    /* non-standard names (ngx_str_t) */
 
     ngx_str_t                      mail_backend_addr; /* waf_mail_backend ip  */
     ngx_str_t                      mail_backend_port; /* waf_mail_backend port*/
@@ -101,6 +109,9 @@ typedef struct {
     unsigned              verdict_set:1; /* reason resolved by preaccess handler    */
     u_char                country[2];    /* ISO-2 verbatim; {0,0}=unknown          */
     ngx_http_waf_reason_e reason;         /* $waf_reason outcome (valid iff verdict_set) */
+
+    unsigned              asn_done:1;     /* asn resolved (lazy guard)              */
+    uint32_t              asn;            /* $waf_asn outcome; 0=unknown            */
 } ngx_http_waf_ctx_t;
 
 
