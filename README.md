@@ -41,8 +41,8 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 ├── cmake/Versions.cmake         pinned PKG_* versions, URLs, SHA256 hashes
 ├── modules/ngx_http_waf/        the dynamic module
 │   ├── config                   nginx addon build descriptor (one .so, 2 modules)
-│   ├── scanners.list            scanner path patterns (hot-reloadable)
-│   ├── lists/                   UA signature lists (hot-reloadable)
+│   ├── lists/                   path & UA signature lists (hot-reloadable)
+│   │   ├── scanners.list           scanner path patterns -> 403/404
 │   │   ├── scanner-ua.list         security tools  -> $waf_type=scanner
 │   │   ├── ai-crawler.list         LLM/AI crawlers -> $waf_type=ai-crawler
 │   │   ├── crawler.list            search engines  -> $waf_type=crawler
@@ -567,7 +567,7 @@ load_module .../sandbox/modules/ngx_http_waf_module.so;
 http {
     waf               on;
     waf_bot_block     on;
-    waf_scanner_list  /etc/nginx/scanners.list;
+    waf_scanner_list  /etc/nginx/lists/scanners.list;
 
     # UA classification ($waf_type) — always on, blocking is separate
     waf_scanner_ua_list /etc/nginx/lists/scanner-ua.list;
