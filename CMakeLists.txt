@@ -10,9 +10,9 @@
 #   sandbox/modules/ngx_http_waf_module.so   (the WAF dynamic module)
 #
 # Dependency chain:
-#   zlibng_ext  --(static libz.a + zlib.h)--\
-#                                            +--> nginx_ext  (builds OpenSSL
-#   openssl_src --(download + extract only)--/         in-tree, links zlib-ng)
+#   zlibng_ext  --(static libz.a + zlib.h)----\
+#   openssl_src --(download + extract only)---+--> nginx_ext  (builds OpenSSL +
+#   pcre2_src   --(download + extract only)---/    PCRE2 in-tree, links zlib-ng)
 # ============================================================================
 cmake_minimum_required(VERSION 3.16)
 project(nginx_edge_firewall NONE)
@@ -59,7 +59,22 @@ ExternalProject_Get_Property(openssl_src SOURCE_DIR)
 set(OPENSSL_SRC_DIR ${SOURCE_DIR})
 
 # ============================================================================
-# 3. nginx + WAF module
+# 3. PCRE2 — download + extract only; nginx builds it in-tree via
+#    --with-pcre=<src> (the same model as OpenSSL above). Pinned + SHA256-
+#    verified so the regex engine the WAF's ngx_regex_* calls run on is
+#    hermetic, not whatever PCRE the host happens to ship.
+# ============================================================================
+ExternalProject_Add(pcre2_src
+  URL               ${PCRE2_URL}
+  URL_HASH          SHA256=${PCRE2_SHA256}
+  CONFIGURE_COMMAND ""
+  BUILD_COMMAND     ""
+  INSTALL_COMMAND   "")
+ExternalProject_Get_Property(pcre2_src SOURCE_DIR)
+set(PCRE2_SRC_DIR ${SOURCE_DIR})
+
+# ============================================================================
+# 4. nginx + WAF module
 #    --prefix=${SANDBOX_DIR} : no-root `make install` at a stable repo path
 #    -I/-L zlib-ng opts   : NOT --with-zlib (breaks on zlib-ng); the cc/ld
 #                           opts make the gzip probe + final link pick libz.a
@@ -72,14 +87,14 @@ set(_SSL_HEADER "${OPENSSL_SRC_DIR}/.openssl/include/openssl/ssl.h")
 set(_NGINX_BUILD_SH "test -f ${_SSL_HEADER} && touch ${_SSL_HEADER}; make -j${NPROC}")
 
 ExternalProject_Add(nginx_ext
-  DEPENDS          zlibng_ext openssl_src
+  DEPENDS          zlibng_ext openssl_src pcre2_src
   URL              ${NGINX_URL}
   URL_HASH         SHA256=${NGINX_SHA256}
   BUILD_IN_SOURCE  TRUE
   CONFIGURE_COMMAND <SOURCE_DIR>/configure
       --prefix=${SANDBOX_DIR} --build=E
       --with-stream --with-stream_realip_module --with-stream_ssl_preread_module
-      --with-pcre --with-pcre-jit --with-http_stub_status_module
+      --with-pcre=${PCRE2_SRC_DIR} --with-pcre-jit --with-http_stub_status_module
       --with-threads --with-file-aio
       --with-http_ssl_module --with-http_v2_module --with-http_v3_module
       --with-http_realip_module --with-http_addition_module
