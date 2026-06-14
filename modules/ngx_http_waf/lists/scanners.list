@@ -9,20 +9,23 @@
 # style rules that blocked legitimate paths like /index.html). Patterns
 # sharing an action are compiled into one alternation regex.
 #
+# Secret/dotfile rules use (^|/) so they also catch nested probes such as
+# /app/.env or /x/.git/config (scanners walk many path prefixes).
+#
 # This file is hot-reloadable: `nginx -s reload` re-reads and recompiles it.
 
 # ---- WordPress -------------------------------------------------------------
 ^/wp-
 ^/xmlrpc\.php$
-^/wordpress/
+^/wordpress
 
 # ---- VCS / secrets / dotfiles ---------------------------------------------
-^/\.git
-^/\.svn
-^/\.hg
-^/\.env
-^/\.aws/
-^/\.ssh/
+(^|/)\.git
+(^|/)\.svn
+(^|/)\.hg
+(^|/)\.env
+(^|/)\.aws/
+(^|/)\.ssh/
 ^/\.DS_Store$
 ^/\.vscode/
 ^/\.well-known/(?!acme-challenge/)
@@ -42,8 +45,10 @@
 ^/phpmyadmin/ 403
 ^/pma/ 403
 ^/vendor/phpunit/
+phpunit/.{0,40}eval-stdin\.php
 ^/_ignition/execute-solution$
 ^/telescope/requests$
+^/_profiler
 
 # ---- mail / exchange / OWA -------------------------------------------------
 ^/owa
@@ -56,6 +61,7 @@
 ^/remote/fgt_lang
 ^/api/v2/cmdb/system/admin/admin
 ^/HNAP1
+^/SDK/webLanguage
 ^/boaform/
 ^/cgi-bin/
 ^/actuator
