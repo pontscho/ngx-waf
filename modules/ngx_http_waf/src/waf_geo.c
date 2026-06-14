@@ -35,7 +35,7 @@ ngx_http_waf_geo_cleanup(void *data)
 ngx_http_waf_geo_db_t *
 ngx_http_waf_geo_open(ngx_conf_t *cf, ngx_str_t *path)
 {
-    u_char                  *base, *hdr, *p, *pend;
+    u_char                  *base, *hdr;
     size_t                   size;
     uint32_t                 off, len, nxt;
     ngx_fd_t                 fd;
@@ -141,16 +141,6 @@ ngx_http_waf_geo_open(ngx_conf_t *cf, ngx_str_t *path)
                                    + off + (i < 80 ? 0 : 4));
     }
     db->ipv4root = nxt;
-
-    /* 10-bit country-code index into the country table. */
-    ngx_memset(db->cc_map, 0xFF, sizeof(db->cc_map));
-    i = 0;
-    p = db->block[NGX_HTTP_WAF_GEO_CO];
-    pend = p + db->block_len[NGX_HTTP_WAF_GEO_CO];
-    for (; p + 8 <= pend; p += 8) {
-        ngx_uint_t  key = p[0] ^ ((p[1] & 31) << 5);
-        db->cc_map[key] = (uint16_t) i++;
-    }
 
     ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
         "waf: geo database \"%V\" loaded (%uz bytes, %ui networks)",

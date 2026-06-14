@@ -44,7 +44,6 @@ typedef struct ngx_http_waf_geo_db_s {
     uint32_t     block_len[NGX_HTTP_WAF_GEO_BLOCKS];
 
     uint32_t     ipv4root;                       /* IPv4 trie root node*/
-    uint16_t     cc_map[32 * 32];                /* 10-bit CC index    */
 
     ngx_str_t    path;
 } ngx_http_waf_geo_db_t;

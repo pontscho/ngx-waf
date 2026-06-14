@@ -116,6 +116,14 @@ ngx_http_waf_cc_chars(uint16_t cc16, u_char out[2])
 
 
 /*
+ * Fixed (non per-country, non per-vhost) metric-line headroom: health plus all
+ * global / reason / would_block / ua / flag / scanner / resp lines, with two
+ * extra WAF_REASON_MAX loops budgeted for would_block. Must stay >= the number
+ * of unconditional lines the serializer emits.
+ */
+#define WAF_STAT_FIXED_LINES  96
+
+/*
  * Compute a true upper bound on the rendered body size. Each metric line is
  * capped at WAF_STAT_LINE; per-vhost lines additionally carry the server
  * name, whose escaped form can expand up to 6x (JSON \u00XX worst case), so
@@ -131,7 +139,7 @@ ngx_http_waf_status_bufsize(ngx_uint_t nvhosts,
 
     /* fixed section: health + all global/reason/would_block/ua/flag/scanner/
      * resp lines (two extra WAF_REASON_MAX loops for would_block headroom) */
-    size = 96 * WAF_STAT_LINE;
+    size = WAF_STAT_FIXED_LINES * WAF_STAT_LINE;
 
     /* per-country: up to two metric lines per slot */
     if (WAF_STAT_CC_SLOTS > (NGX_MAX_SIZE_T_VALUE / (2 * WAF_STAT_LINE))) {
