@@ -1,10 +1,12 @@
 /*
  * ngx_http_waf_module - shared reputation core
  *
- * See waf_reputation.h. Special IPFire country codes (A1 anonymous proxy,
- * A2 satellite, A3 anycast, T1 Tor exit, XD drop) are blocked through the
- * same packed-CC list as ISO countries; the libloc uint16 network-flags
- * field is matched separately via flag_mask. Either signal denies.
+ * See waf_reputation.h. The special IPFire source codes from waf_flag_block
+ * (A1 anonymous proxy, A2 satellite, A3 anycast, T1 Tor exit, XD drop) deny
+ * in BOTH block and whitelist modes: via the libloc uint16 network-flags
+ * field (flag_mask) and, for codes that carry no flag bit such as Tor's T1,
+ * via the separate flag_cc packed-CC list. The plain ISO block_cc/allow_cc
+ * lists are the mutually exclusive country policy. Any signal denies.
  */
 
 #include "waf_reputation.h"
@@ -129,6 +131,26 @@ ngx_http_waf_reputation_check(ngx_waf_rep_conf_t *rep,
     }
 
     cc16 = (uint16_t) ((res.country[0] << 8) | res.country[1]);
+
+    /*
+     * Special source codes from waf_flag_block (A1/A2/A3/T1/XD) deny in both
+     * modes, like flag_mask above: they mark the source itself (Tor / anon /
+     * satellite / drop), independent of the country allow/deny policy. Tor
+     * carries the T1 code but no flag bit, so flag_mask alone would miss it.
+     */
+    if (rep->flag_cc) {
+        codes = rep->flag_cc->elts;
+
+        for (i = 0; i < rep->flag_cc->nelts; i++) {
+            if (codes[i] == cc16) {
+                ngx_str_set(reason, "network flag");
+                if (out != NULL) {
+                    out->reason = WAF_REASON_FLAG;
+                }
+                return NGX_HTTP_FORBIDDEN;
+            }
+        }
+    }
 
     /*
      * Whitelist mode wins when set: the country must be listed or the
@@ -313,7 +335,7 @@ ngx_http_waf_flag_add(ngx_conf_t *cf, ngx_waf_rep_conf_t *rep,
     rep->flag_mask |= flag;
 
     if (cc.len) {
-        if (ngx_http_waf_country_add(cf, &rep->block_cc, &cc) != NGX_OK) {
+        if (ngx_http_waf_country_add(cf, &rep->flag_cc, &cc) != NGX_OK) {
             return NGX_ERROR;
         }
     }

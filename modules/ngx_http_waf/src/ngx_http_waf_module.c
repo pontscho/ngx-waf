@@ -921,6 +921,9 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->rep.block_cc == NULL) {
         conf->rep.block_cc = prev->rep.block_cc;
     }
+    if (conf->rep.flag_cc == NULL) {
+        conf->rep.flag_cc = prev->rep.flag_cc;
+    }
     if (conf->rep.block_asn == NULL) {
         conf->rep.block_asn = prev->rep.block_asn;
     }
