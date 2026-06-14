@@ -192,6 +192,8 @@ variable, independent of `waf` / `waf_bot_block`.
 | `waf_ai_crawler_list` | `<path>` | — | UA signatures for LLM/AI crawlers → `$waf_type=ai-crawler`. |
 | `waf_crawler_list` | `<path>` | — | UA signatures for search-engine/archival crawlers → `$waf_type=crawler`. |
 | `waf_bot_list` | `<path>` | — | UA signatures for social/monitor/feed/HTTP-library clients → `$waf_type=bot`. |
+| `waf_fake_bot_block` | `on`\|`off` | `off` | Verify a self-declared crawler really originates from its operator's published IP ranges. When `on`, a request whose `$waf_type` is `crawler`/`ai-crawler` **and** whose class has a `waf_verified_bot` CIDR list configured is blocked **403** when the canonical client IP is **not** inside that list (a fake bot). A class with no list is silently skipped. Independent of `waf_bot_block`; detect-mode-aware (records `would_block[fake_bot]`). See [Verified-bot verification](#verified-bot-fake-bot-verification). |
+| `waf_verified_bot` | `<class> <path>` | — | Load the published CIDR allowlist for one verifiable class. `<class>` is `crawler` or `ai_crawler` (any other token is a config error); `<path>` is a plain CIDR-per-line file. Per class; **hot-reloadable**. Used only when `waf_fake_bot_block` is `on`. |
 | `waf_server_token` | `<string>` | `Apache/2.4.68 (Unix)` | The fake `Server:` token and the error-page fingerprint. |
 | `waf_geo_db` | `<path>` | — | Path to the IPFire `location.db` (mmap'd read-only; read by the embedded nanolibloc adaptation, no libloc dependency). |
 | `waf_geo_block` | `<CC> …` | — | Block these country codes (ISO-3166 two-letter, plus IPFire specials A1/A2/A3/T1/XD) → 403. |
@@ -302,6 +304,63 @@ distilled from Matomo `bots.yml`, monperrus/crawler-user-agents,
 ai.robots.txt, and CrawlerDetect. They drift (AI crawlers especially) — a
 config reload recompiles them, so updates are a reload, not a rebuild.
 
+### Verified-bot (fake-bot) verification
+
+UA classification alone trusts the client's word: anyone can send
+`User-Agent: Googlebot`. Real crawlers publish the IP ranges they originate
+from; impersonators do not. With `waf_fake_bot_block on` and a `waf_verified_bot`
+list for the class, the `PREACCESS` phase blocks (**403**) a request that *claims*
+to be a `crawler`/`ai-crawler` but whose canonical client IP is **outside** the
+published range.
+
+The check is **fully stateless**: no reverse/forward DNS, no per-IP cache, no
+request-path I/O. The published ranges are downloaded **offline** (a cron job
+converts e.g. Google's `googlebot.json` into a plain CIDR list) and loaded once
+at config time, then matched with nginx's built-in `ngx_cidr_match`. It runs
+*after* the `waf_bot_block` UA gate and *before* the scanner-path scan.
+
+```nginx
+waf_fake_bot_block on;
+waf_verified_bot   crawler    /etc/nginx/lists/verified-googlebot.list;
+waf_verified_bot   ai_crawler /etc/nginx/lists/verified-ai.list;
+```
+
+**Verified-bot CIDR file format** — one `addr/prefix` per line; blank lines and
+lines starting with `#` are ignored. Producing the file (JSON → CIDR) is the
+offline cron's job, never the WAF's.
+
+```
+# verified-googlebot.list (excerpt)
+66.249.64.0/19
+2001:4860:4801::/48
+```
+
+- **Class token** is `crawler` or `ai_crawler` (underscore — the config token,
+  distinct from the hyphenated `$waf_type` value `ai-crawler`). Any other token
+  is a hard config error.
+- **Empty / comments-only file** → the class is left **unconfigured and silently
+  skipped** (it is never a zero-element "block everything" allowlist). A
+  **malformed CIDR line** aborts the reload (the old config stays live) — it
+  never degrades to a permissive state.
+- **Staged rollout:** run a newly-added class under `waf detect` first — it
+  records `would_block[fake_bot]` without blocking, so you can prove the list is
+  complete before enforcing.
+- **`waf_allowlist` does *not* exempt a fake bot.** The allowlist short-circuits
+  the reputation head only; an allowlisted IP that sends `User-Agent: Googlebot`
+  from outside the verified range is still 403'd. Allowlist governs *who*, this
+  check governs *UA honesty* — they are orthogonal.
+- **XFF is load-bearing here.** Because this now gates an **allow** decision on
+  the client IP, the canonical IP must be trustworthy: it is XFF-derived only
+  when the connection peer is in [`waf_trusted_proxy`](#configuration) (recursive
+  walk). List **only** genuinely controlled CDN/LB ranges there, and have the
+  front proxy *overwrite* (not append) the client `X-Forwarded-For` — otherwise a
+  spoofed leftmost address could be honoured. A direct attacker who is *not*
+  behind a trusted proxy cannot influence the IP and is correctly blocked.
+- **Cost.** `ngx_cidr_match` is O(n) per request. Googlebot/Bingbot ranges are
+  tiny (negligible). `ai_crawler` published lists can be large, and
+  `User-Agent: GPTBot` spam forces the full scan — an accepted, opt-in trade-off;
+  revisit only if a list grows past a few hundred CIDRs.
+
 ### Verdict variables (`$waf_country`, `$waf_reason`)
 
 Two further `NOCACHEABLE` log variables sit alongside `$waf_type`, sharing the
@@ -313,7 +372,7 @@ all active):
 |---|---|
 | `$waf_country` | The client's ISO-3166 two-letter geo country (or an IPFire special A1/A2/A3/T1/XD). Resolves to *not found* (`-` in logs) when no geo record exists or `waf_geo_db` is unset. |
 | `$waf_asn` | The client's autonomous-system number (decimal) from the geo DB. *Not found* (`-`) when `asn==0`, no record, or `waf_geo_db` is unset. Shares the per-request geo lookup, so it costs no extra DB hit. |
-| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`, `asn`, `method`. In `detect` mode it carries the *would-be* reason. |
+| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`, `asn`, `method`, `args`, `cookie`, `referer`, `fake_bot`. In `detect` mode it carries the *would-be* reason. |
 | `$waf_ja4_hash` | The [JA4](https://github.com/FoxIO-LLC/ja4) TLS client fingerprint (`t13d1516h2_…_…`), computed at the TLS handshake. **Observability only — never blocks.** *Not found* on plain HTTP / non-TLS. Works for TCP-TLS (HTTP/1.1, H2) and QUIC/H3 (the `q…` form). |
 
 ```nginx
