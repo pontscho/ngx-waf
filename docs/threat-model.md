@@ -194,8 +194,8 @@ geo/ASN tuning in §6 (D).
 ## 6. Methodology — data-driven rule tuning
 
 The rule set is maintained as a **repeatable gap-analysis loop** against this
-corpus, not by intuition. The four work-streams (A–D); **A is done**, B–D are
-planned.
+corpus, not by intuition. The four work-streams (A–D): **A and C are done**; B
+is tracked in `docs/honeypot-B-plan.md`, D is planned.
 
 ### A — Gap-analysis → `scanners.list` growth (DONE)
 
@@ -233,15 +233,41 @@ WAF in `waf detect;` mode and read the `would_block[reason]` counters:
 - **Output:** an FP rate on the legit set and a TP rate on the hostile set, per
   rule change — the safety gate for flipping `detect → enforce`.
 
-### C — Real-attack replay regression fixture (planned)
+### C — Real-attack replay regression fixture (DONE)
 
-Distil a representative, **deduplicated, anonymised** set of real hostile paths
-from the corpus (top-N per class in §3) into a fixture, and have the test
-harness (modelled on `tests/run-stat-tests.sh`) replay it against the sandbox
-WAF, asserting the expected block status (404/403/`499`-for-444). This guards
-against regressions: a botched `scanners.list` edit that stops matching
-`/.env` or `/wp-login.php` fails CI. It complements the existing 6 unit + 57
-integration tests with **live-fire** samples.
+The detect-mode coverage from B is distilled into a **frozen, committed**
+fixture and asserted in **enforce** mode, so a future list edit that silently
+stops matching `/.env` or `/wp-login.php` — or changes its action
+(404↔403↔444) — fails the harness. Partner decision: the fixture is the FULL
+covered set (every vector the WAF blocks today), not top-N.
+
+The procedure (reproducible, core-perl + nginx only — **no docker**):
+
+1. **Freeze** (`tests/corpus/freeze-regression-fixture.pl`, run once against a
+   live regression-nginx): a two-pass probe per dimension. The *detect* vhost
+   yields the authoritative `X-WAF-Reason`; a vector is frozen iff its reason
+   != `none`. The *enforce* vhost then yields the real HTTP status. Frozen
+   verdict = `{expected_reason: detect, expected_status: enforce}`. Outputs the
+   committed `regression-vectors.jsonl` (path/args, keyed by uri) and
+   `regression-headers.jsonl` (ua/referer/cookie/fakebot, keyed by value).
+2. **Assert** (`tests/run-regression-tests.sh`, modelled on `run-stat-tests.sh`):
+   an FP gate (benign baseline must not block) plus an enforce replay of the
+   committed fixture, joining each result to its frozen verdict and asserting
+   the `(reason,status)` tuple per vector. A 444 (`NGX_HTTP_CLOSE`, observed as
+   a byte-0 connection close — no `X-WAF-Reason` reaches the wire) is asserted
+   status-only; its reason stands frozen from generation time.
+
+The harness uses a dedicated config (`tests/waf-regression-test.conf`, ports
+283xx) with detect+enforce vhost pairs and **exactly one matcher per vhost**
+(PREACCESS is first-match-wins, so dimensions stay isolated); no `proxy_pass`,
+no `waf_trusted_proxy`, no rate/geo — the only verdict is the matcher under
+test. `replay-client.pl` gained an `--enforce` mode (a fresh `Connection: close`
+socket per request, so a byte-0 EOF is an unambiguous 444).
+
+Current frozen fixture: **21,263** path/args vectors + **160** header vectors
+(`expected_status` ∈ {404: 21,192, 403: 192, 444: 39}); the enforce replay runs
+in ~20 s and asserts 100% frozen-match. It complements the existing 6 unit +
+131 integration tests with **live-fire** samples.
 
 ### D — ASN / geo tuning from attacker IPs (planned)
 

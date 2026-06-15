@@ -29,6 +29,7 @@ my $header_name;
 my $out_file;
 my $limit     = 0;
 my $benign_ua = 'Mozilla/5.0 (replay-benign)';
+my $enforce   = 0;
 
 GetOptions(
     'host=s'      => \$host,
@@ -39,7 +40,8 @@ GetOptions(
     'out=s'       => \$out_file,
     'limit=i'     => \$limit,
     'benign-ua=s' => \$benign_ua,
-) or die "Usage: $0 --port N --kind {path|header|baseline} [options]\n";
+    'enforce'     => \$enforce,
+) or die "Usage: $0 --port N --kind {path|header|baseline} [--enforce] [options]\n";
 
 die "--port is required\n"  unless defined $port;
 die "--kind is required\n"  unless defined $kind;
@@ -55,6 +57,13 @@ die "--header must be User-Agent, Referer, or Cookie\n"
     && $header_name ne 'Referer'
     && $header_name ne 'Cookie';
 die "--out FILE is required\n" unless defined $out_file;
+
+# enforce mode: assert the REAL HTTP status (404/403, and 444 via connection
+# close). Each request goes on a FRESH socket with "Connection: close", so a
+# byte-0 EOF on the status line is unambiguously a 444 (NGX_HTTP_CLOSE) -- the
+# stateful keep-alive idle-close ambiguity disappears. Detect mode (the
+# default) stays byte-for-byte unchanged.
+my $conn_hdr = $enforce ? 'close' : 'keep-alive';
 
 # ---------------------------------------------------------------------------
 # JSON encoder (core-perl)
@@ -105,7 +114,9 @@ sub connect_sock {
     $sock->autoflush(1);
 }
 
-connect_sock();
+# enforce mode reconnects per request (fresh socket per vector); this initial
+# connect is only for the keep-alive detect-mode sweep.
+connect_sock() unless $enforce;
 
 # ---------------------------------------------------------------------------
 # Response reading
@@ -126,8 +137,12 @@ sub read_exact {
 
 # Read one line (\r\n or \n terminated) from socket.
 # Returns the line without line terminator, or undef on EOF.
+# $prefix: bytes already consumed from the socket that belong at the line head
+# (used by the enforce-mode first-byte probe). It is a single status-line byte
+# ('H'), never a terminator, so the loop's "\n" check below is unaffected.
 sub read_line {
-    my $line = '';
+    my ($prefix) = @_;
+    my $line = defined $prefix ? $prefix : '';
     while (1) {
         my $byte;
         my $r = $sock->read($byte, 1);
@@ -166,7 +181,22 @@ sub read_response {
     my ($no_body) = @_;
     $no_body //= 0;
 
-    my $status_line = read_line();
+    # [H2] enforce-mode first-byte probe: a 444 (NGX_HTTP_CLOSE) is zero response
+    # bytes -- the very first read sees EOF. We MUST distinguish that from a
+    # truncated mid-response (a hard error, never silently a 444). So probe one
+    # byte first: EOF here == byte-0 close == 444 ('CLOSED' sentinel). A byte
+    # here means a real response is coming; we prepend it to the status line and
+    # parse as usual. After this point, any EOF is mid-response truncation and
+    # returns undef -> the caller maps it to a reserved hard-error status, NOT
+    # 444. In detect mode $prefix stays '' and this is byte-for-byte the old path.
+    my $prefix = '';
+    if ($enforce) {
+        my $first = read_exact(1);
+        return ('CLOSED', undef) unless defined $first;
+        $prefix = $first;
+    }
+
+    my $status_line = read_line($prefix);
     return undef unless defined $status_line && $status_line ne '';
 
     my ($code) = $status_line =~ m{^HTTP/\d\.\d\s+(\d+)};
@@ -217,6 +247,25 @@ sub read_response {
 sub send_request_and_read {
     my ($request_bytes, $no_body) = @_;
     $no_body //= 0;
+
+    # [H1] enforce: a FRESH socket per request (Connection: close). The reconnect
+    # target is ALWAYS the literal ($host,$port) inside connect_sock() -- never
+    # derived from a vector/response byte (S1). No resend loop: with one
+    # connection per request a byte-0 EOF is a deterministic 444, not a
+    # keep-alive idle close, so the [security #5] max-one-resend is moot here.
+    if ($enforce) {
+        connect_sock();
+        print $sock $request_bytes;
+        my ($code, $reason) = read_response($no_body);
+        # [M1] map the 'CLOSED' sentinel to the 444 INTEGER before record_result
+        # (status+0): 'CLOSED'+0 == 0 is a Perl trap we must not hit.
+        return (444, $reason) if defined $code && $code eq 'CLOSED';
+        # mid-response truncation (read_response returned undef AFTER the probe
+        # byte): a hard error. Reserved status 0 -- never equals an expected
+        # 404/403/444, so the harness flags it loudly instead of miscounting.
+        return (0, undef) unless defined $code;
+        return ($code, $reason);
+    }
 
     for my $attempt (1..2) {
         print $sock $request_bytes;
@@ -286,7 +335,7 @@ sub process_path {
     my $req = "$method $uri HTTP/1.1\r\n"
             . "Host: replay\r\n"
             . "User-Agent: $benign_ua\r\n"
-            . "Connection: keep-alive\r\n"
+            . "Connection: $conn_hdr\r\n"
             . "\r\n";
 
     # HEAD responses carry headers but no body (RFC 7230 §3.3)
@@ -330,7 +379,7 @@ sub process_header {
     }
     # S3: exactly one header line; value has been verified free of CR/LF
     $req .= "$header_name: $value\r\n"
-          . "Connection: keep-alive\r\n"
+          . "Connection: $conn_hdr\r\n"
           . "\r\n";
 
     my ($code, $reason) = send_request_and_read($req);
@@ -352,7 +401,7 @@ sub process_baseline {
     my $req = "GET $path HTTP/1.1\r\n"
             . "Host: replay\r\n"
             . "User-Agent: $benign_ua\r\n"
-            . "Connection: keep-alive\r\n"
+            . "Connection: $conn_hdr\r\n"
             . "\r\n";
 
     my ($code, $reason) = send_request_and_read($req);
@@ -413,6 +462,7 @@ close $sock if $sock;
 print STDERR "=== replay-client summary ===\n";
 print STDERR "kind:              $kind\n";
 print STDERR "port:              $port\n";
+print STDERR "mode:              ", ($enforce ? 'enforce' : 'detect'), "\n";
 print STDERR "sent:              $sent\n";
 print STDERR "reconnects:        $reconnects\n";
 print STDERR "skipped_absolute:  $skipped_absolute\n";

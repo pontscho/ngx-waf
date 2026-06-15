@@ -38,3 +38,9 @@ ngxlogs/
 /modules/ngx_http_waf/tests/corpus/replay-fp-report.txt
 /modules/ngx_http_waf/tests/corpus/replay-coverage-report.txt
 /modules/ngx_http_waf/tests/corpus/replay-uncovered.jsonl
+
+# work-stream C regression net: the FROZEN fixtures (regression-vectors.jsonl +
+# regression-headers.jsonl) ARE committed -- they carry the expected verdicts
+# the enforce harness asserts. Only the freeze/harness per-run scratch dir
+# (detect/enforce probe outputs, covered-subset feeds, compare.pl) is ignored.
+/modules/ngx_http_waf/tests/corpus/.freeze-tmp/
