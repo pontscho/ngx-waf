@@ -236,6 +236,25 @@ phpmyadmin/pma paths that end in `.php` now return **404 instead of 403** — th
 stay blocked, just blended into the backdrop 404s (the §2 "hide the fingerprint"
 goal). The phpmyadmin/pma *directory* probes keep their 403.
 
+A **second 2026-06-15 iteration** extended the config/secret surface from the B
+uncovered export. The edge serves no config/IaC formats, so blanket extension
+rules (`\.ya?ml$`, `\.properties$`, `\.tfstate`/`\.tfvars`) are FP-clean here (the
+B gate confirmed zero baseline hits); distinctive `.json`/dotfile secret stores
+(`credentials.json`, `composer.json`/`.lock`, `.npmrc`/`.netrc`/`.htpasswd`,
+`.kube`/`.docker/config.json`, Rails `config/credentials`, `appsettings.<env>.json`)
+are enumerated instead (a blanket `.json` rule would hit the `/app.json` baseline).
+Also added: Symfony web-profiler `/debug/default/view`, the `.phpN` and IIS
+`.php::$DATA` source-leak tail on the generic `.php` rule, and a cluster of
+distinctive appliance/VPN/RCE fingerprints (Citrix `WPnBr.dll`, Telerik
+`WebResource.axd`, GPON `GponForm`, Cisco `/+CSCOL+/`, SAP `metadatauploader`,
+D-Link `getuser`, Pulse `/dana-{na,cached}/`, F5 `/mgmt/tm/util/bash`, SonicWall
+`/api/sonicos/`, MobileIron `/mifs/`, ColdFusion `/CFIDE/`, Sitecore). This lifted
+the `uncatalogued` class 21.6% → **35.3%** (and `appliance` to **100%**). The bare
+dictionary tail (`/login`, `/home`, `/admin`, `/test`, …) was deliberately
+**excluded** — those can be legitimate navigation and the B gate sees only the
+baseline corpus, not production traffic. All new path patterns are 404 (blend-in),
+so the re-freeze grew only the 404 bucket (403/444 byte-identical).
+
 > **Coverage caveat.** "24.8% of requests" is not "24.8% of attacks" — the
 > denominator includes the ~36% legitimate noise (`/`, `app.css`, `app.json`).
 > Coverage of the *hostile* subset is far higher; treat the headline % as a
@@ -285,10 +304,10 @@ no `waf_trusted_proxy`, no rate/geo — the only verdict is the matcher under
 test. `replay-client.pl` gained an `--enforce` mode (a fresh `Connection: close`
 socket per request, so a byte-0 EOF is an unambiguous 444).
 
-Current frozen fixture: **38,905** path/args vectors + **160** header vectors
-(`expected_status` ∈ {404: 38,864, 403: 146, 444: 55}); the enforce replay runs
-in ~25 s and asserts 100% frozen-match. (Re-frozen 2026-06-15 after the §6 A
-gap-loop list growth — a fixture re-freeze is mandatory whenever a list edit
+Current frozen fixture: **40,614** path/args vectors + **160** header vectors
+(`expected_status` ∈ {404: 40,573, 403: 146, 444: 55}); the enforce replay runs
+in ~25 s and asserts 100% frozen-match. (Re-frozen 2026-06-15 across two §6 A
+gap-loop iterations — a fixture re-freeze is mandatory whenever a list edit
 intentionally changes coverage or an action bucket.) It complements the existing 6 unit +
 131 integration tests with **live-fire** samples.
 

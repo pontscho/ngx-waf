@@ -50,12 +50,15 @@ phpunit/.{0,40}eval-stdin\.php
 ^/_ignition/execute-solution$
 ^/telescope/requests$
 ^/_profiler
+(^|/)debug/default/view
 # Generic .php catch-all. This edge serves no PHP app (every .php 404'd in the
 # corpus; the legit baseline has zero .php), so a blanket extension rule has no
 # false-positive surface here -- validated by the work-stream B detect FP gate.
 # Raises php-class path coverage 41.6%->~95% (+~127k random-named webshell /
-# probe paths). Matches path-info too (/app_dev.php/_profiler/...).
-^/.*\.php(/|$)
+# probe paths). Matches path-info (/app_dev.php/_profiler/...), .phpN webshells
+# (.php5/.php7), and IIS source-leak suffixes (.php::$DATA, .php~, .php.old).
+^/.*\.php[0-9]?($|[/.~:])
+^/phpinfo
 
 # ---- mail / exchange / OWA -------------------------------------------------
 ^/owa
@@ -84,16 +87,70 @@ phpunit/.{0,40}eval-stdin\.php
 ^/_all_dbs$
 ^/dns-query
 ^/resolve\?
+^/scripts/WPnBr\.dll$
+(^|/)Telerik\.Web\.UI\.WebResource\.axd
+(^|/)GponForm/
+^/\+CSCOL\+/
+(^|/)developmentserver/metadatauploader
+^/config/getuser
+^/dana-na/
+^/dana-cached/
+^/mgmt/tm/util/bash
+^/api/sonicos/
+(^|/)mifs/
+^/CFIDE/
+^/sitecore/
+^/RDWeb/
+^/evox/about
+^/parastable/
+(^|/)etc/passwd
 
-# ---- credential / config / infra-API leaks (2026-06 gap-loop) -------------
+# ---- credential / config / infra-API leaks --------------------------------
+# Config/IaC/secret files are never served at this edge (baseline serves only
+# /, /app.*, static assets), so blanket extension rules for config-only formats
+# (.yml/.yaml/.properties/.tfstate/.tfvars) have no false-positive surface here
+# -- validated by the work-stream B detect FP gate. Distinctive .json/dotfile
+# secret stores are enumerated instead (a blanket .json rule would hit the
+# /app.json baseline). 2026-06 gap-loop, extended.
 (^|/)aws/credentials
 ^/credentials$
 ^/.*\.env$
+^/.*\.ya?ml$
+^/.*\.properties$
+^/.*\.tfstate
+^/.*\.tfvars$
+(^|/)appsettings(\.[A-Za-z]+)?\.json$
+(^|/)credentials\.json$
+(^|/)client_secrets\.json$
 (^|/)secrets\.json$
-(^|/)appsettings\.json$
+(^|/)auth\.json$
+(^|/)composer\.(json|lock)$
+(^|/)sftp-config\.json$
+(^|/)settings\.json$
+(^|/)local\.settings\.json$
+(^|/)\.runtimeconfig\.json$
+(^|/)env\.(json|txt)$
+(^|/)connectionstrings\.config$
+^/Web\.(Debug|Release)\.config$
+^/web\.config[~.]
+(^|/)settings\.py$
+(^|/)global\.asax$
+(^|/)\.npmrc$
+(^|/)\.netrc$
+(^|/)\.htpasswd$
+(^|/)\.dockerenv$
+(^|/)\.kube/
+(^|/)\.composer/
+(^|/)\.docker/config\.json$
+(^|/)config/credentials
+(^|/)config/master\.key$
+(^|/)storage/logs/
+^/error\.log$
 ^/env$
 (^|/)containers/json
 ^/server-status
+^/server-info$
+^/nginx_status$
 ^/druid/
 
 # ---- generic admin / installer probes -------------------------------------
