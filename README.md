@@ -851,6 +851,36 @@ volumes, source/UA intelligence, the protocol-junk analysis, and the A–D
 tuning/test program (gap-analysis · detect-mode FP/TP replay · real-attack
 regression fixtures · geo/ASN tuning).
 
+**Corpus tooling.** The capture lives in `ngxlogs/access.log` (read-only, not
+tracked); all derived artifacts are IP-free and gitignored under
+`modules/ngx_http_waf/tests/corpus/`. The committable, core-perl tools are:
+
+- **`tests/corpus/extract-replay-vectors.pl`** — single read-only pass over the
+  capture → the deduplicated, §3-class-labelled `replay-vectors.jsonl` attack
+  vector set (+ `replay-vectors.summary.txt` sanity gate). `--ua-vectors` /
+  `--referer-vectors` additionally emit the raw User-Agent / Referer header
+  feeds (the only request headers the combined log preserves).
+- **`tests/corpus/build-header-fixtures.pl`** — assembles the per-dimension
+  replay fixtures (UA / Referer / Cookie / fake-bot) by merging the corpus
+  feeds with the external threat-intel below and synthetic SQLi, sanitizing the
+  uncurated lists (drop control bytes / comments, decode HTML entities).
+- **`tests/waf-replay-test.conf`** — the dimension-clean detect-mode vhosts the
+  corpus is replayed against (exactly one matcher enabled per vhost, no
+  `proxy_pass`, loopback-only, no `waf_trusted_proxy`).
+- **`tests/replay-client.pl`** + **`tests/run-replay-tests.sh`** — the replay
+  harness: a raw-socket HTTP client (always connects to `127.0.0.1`, never to a
+  vector-derived target; per-header CRLF framing; no corpus byte ever reaches a
+  shell) reads each request's verdict off the `X-WAF-Reason` response header
+  (`waf_reason_header on`), and the harness produces an FP gate (legit baseline
+  must stay zero-block), a per-class coverage meter, and a volume-ranked
+  uncovered-hostile export that feeds the gap-analysis loop.
+- **[`docs/threat-intel-sources.md`](docs/threat-intel-sources.md)** — source
+  catalogue for the header-attack fixtures (the log has no Cookie/Host/XFF, so
+  those come from maintained external threat-intel: OWASP CRS, SecLists,
+  nginx-ultimate-bad-bot-blocker, monperrus/crawler-user-agents, FuzzDB).
+- **[`docs/honeypot-B-plan.md`](docs/honeypot-B-plan.md)** — the detect-mode
+  FP/TP replay design (work-stream B): FP gate + per-class coverage meter.
+
 ## Notes & limitations
 
 - HTTP/3 client handshake is not exercised in the sandbox (the host curl

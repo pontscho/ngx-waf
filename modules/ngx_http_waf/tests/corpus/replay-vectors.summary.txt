@@ -1,0 +1,54 @@
+# replay-vectors summary (threat-model §6 step 0)
+# source: ngxlogs/access.log  [UA collapsed to class]
+
+[intake]
+  lines_read               1651507
+  unparseable_lines              0
+  dropped_internal_net      120438   (10.0.0.0/24, §5.1)
+  dropped_malformed          96786   (request != 'METHOD SP URI SP HTTP/x.y', §4)
+  dropped_baseline          634420   (legit example.com traffic)
+  kept_volume               799863   (attack-shaped requests)
+
+[vectors]
+  unique_vectors             84970   ((method,uri,ua,referer))
+  total_matched_volume      799863
+
+[per-class]  (classes overlap; volume=sum(count), vectors=distinct tuples)
+  class               volume    vectors ref(\xc2\xa73)    delta%
+  php                 365613      39603       364455      +0.3
+  wordpress           139187      18520       139228      -0.0
+  secret_vcs          162758      12917       161302      +0.9
+  router_iot           21943        786        22060      -0.5
+  legacy_ext           15351        979        15290      +0.4
+  phpadmin             13492        522        13462      +0.2
+  backup               10824       1235        10837      -0.1
+  appliance             9930        141        10082      -1.5
+  webmail               4067         49         4217      -3.6
+  uncatalogued        168048      26020            -         -
+
+[baseline-excluded top 25 paths]  (sanity: NONE should look hostile)
+        592122  /
+         17162  /favicon.ico
+         12533  /robots.txt
+          2251  /sitemap.xml
+           273  /config.js
+           254  /css/miniweb.css
+           242  /bundle.js
+           186  /+cscoe+/logon_forms.js
+           185  /+cscoe+/transfer.js
+           164  /public/home/js/check.js
+           160  /cf_scripts/scripts/ajax/ckeditor/ckeditor.js
+           156  /jquery-3.3.1.slim.min.js
+           156  /jquery-3.3.2.slim.min.js
+           156  /static/admin/javascript/hetong.js
+           148  /ecosystem.config.js
+           147  /env.js
+           134  /server.js
+           122  /components/app.css
+           118  /components/app.js
+           107  /page/style/index.css
+           101  /config/database.js
+           101  /config/server.js
+            98  /js/newwindow_2_all.js
+            97  /favicon-32x32.png
+            95  /app.js

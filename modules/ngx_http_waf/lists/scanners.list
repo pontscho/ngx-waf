@@ -117,3 +117,25 @@ phpunit/.{0,40}eval-stdin\.php
 
 # ---- extensions that should never be served at this edge ------------------
 ^/.*\.(cgi|asp|aspx|jsp|jsa|cfm|pl)$
+
+# ---- static-extension-cloaked probes (COMMENTED; threat-model §6 step-0) ----
+# Hostile paths that END IN a .js/.css static extension, so the replay-corpus
+# static-ext baseline absorbs them (docs/threat-model.md §6 step 0 surfaced these
+# in the sanity gate). LEFT COMMENTED on purpose: a suffix rule on a static
+# extension can false-positive on a real SPA asset of the same name -- enable
+# each (drop the leading '#') only after a detect-mode FP check (work-stream B).
+# Trailing volumes are from the 2026-06 corpus; comments stay on their own line
+# so an enabled pattern is a clean PCRE2 line.
+#
+# Cisco ASA SSL-VPN probe (logon_forms.js, transfer.js; ~371)
+#^/\+cscoe\+/
+# ColdFusion CKEditor / admin probe (~160)
+#^/cf_scripts/
+# PM2 ecosystem config leak (~148)
+#^/ecosystem\.config\.js$
+# client/env config leak (~147)
+#^/env\.js$
+# server source leak (~134)
+#^/server\.js$
+# DB / server config leak (~200)
+#^/config/(?:database|server)\.js$
