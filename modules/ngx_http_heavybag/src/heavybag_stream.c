@@ -303,9 +303,9 @@ ngx_stream_heavybag_create_srv_conf(ngx_conf_t *cf)
 
 /*
  * STREAM merge step: inherit the mode (fail-closed default) and every
- * reputation field unset at this server level -- geo db, block_cc,
- * block_asn, allow_cc, flag_mask, blocklist and allowlist. Warns when a
- * country whitelist is configured without a geo database.
+ * reputation field unset at this server level -- geo db, block_cc, flag_cc,
+ * block_asn, allow_cc, flag_mask, blocklist and allowlist. Rejects the config
+ * when a geo-dependent deny policy is set without a geo database.
  */
 static char *
 ngx_stream_heavybag_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
@@ -321,6 +321,9 @@ ngx_stream_heavybag_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     if (conf->rep.block_cc == NULL) {
         conf->rep.block_cc = prev->rep.block_cc;
+    }
+    if (conf->rep.flag_cc == NULL) {
+        conf->rep.flag_cc = prev->rep.flag_cc;
     }
     if (conf->rep.block_asn == NULL) {
         conf->rep.block_asn = prev->rep.block_asn;
