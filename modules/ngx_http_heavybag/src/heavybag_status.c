@@ -120,10 +120,18 @@ ngx_http_heavybag_cc_chars(uint16_t cc16, u_char out[2])
 /*
  * Fixed (non per-country, non per-vhost) metric-line headroom: health plus all
  * global / reason / would_block / ua / ua_cat / spoofed / flag / scanner / resp
- * lines, with two extra HEAVYBAG_REASON_MAX loops budgeted for would_block. Must
- * stay >= the number of unconditional lines the serializer emits.
+ * lines. A 128-line base covers the format-invariant scalar lines with ample
+ * headroom; the enum-indexed counter arrays are added on top so adding a
+ * reason / UA / category / action / flag value grows the bound automatically
+ * instead of silently overflowing the rendered buffer.
  */
-#define HEAVYBAG_STAT_FIXED_LINES  128
+#define HEAVYBAG_STAT_FIXED_LINES                                             \
+    (128                       /* format-invariant scalar / health lines */  \
+     + 4 * HEAVYBAG_REASON_MAX /* http+stream blocked + would_block       */  \
+     + HEAVYBAG_UA_MAX         /* http_ua                                 */  \
+     + HEAVYBAG_CAT_MAX        /* http_ua_cat                             */  \
+     + HEAVYBAG_ACTION_MAX     /* http_scanner_path                       */  \
+     + HEAVYBAG_FLAG_SLOTS)    /* flag_blocked                            */
 
 /*
  * Compute a true upper bound on the rendered body size. Each metric line is

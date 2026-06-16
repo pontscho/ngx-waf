@@ -151,7 +151,6 @@ typedef struct {
 
     unsigned          client_resolved:1; /* client_sa lazily resolved (lazy guard) */
     struct sockaddr  *client_sa;      /* canonical client addr: socket peer or XFF  */
-    socklen_t         client_socklen;
 
     ngx_http_heavybag_ua_e ua;             /* $waf_type outcome (valid iff classified) */
 

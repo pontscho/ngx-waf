@@ -457,7 +457,6 @@ ngx_http_heavybag_client_sa(ngx_http_request_t *r,
     }
 
     ctx->client_sa = r->connection->sockaddr;
-    ctx->client_socklen = r->connection->socklen;
 
     if (wlcf->trusted_proxy != NULL && r->headers_in.x_forwarded_for != NULL) {
 
@@ -470,7 +469,6 @@ ngx_http_heavybag_client_sa(ngx_http_request_t *r,
             == NGX_OK)
         {
             ctx->client_sa = addr.sockaddr;
-            ctx->client_socklen = addr.socklen;
         }
     }
 
@@ -1034,11 +1032,12 @@ ngx_http_heavybag_preaccess_handler(ngx_http_request_t *r)
      * Descriptive-UA category distribution + spoof rate. Only computed when the
      * status zone is live: the parse + spoof eval are otherwise lazy (run on
      * first $waf_ua_* access), so a deployment using neither the variables nor
-     * waf_status keeps paying nothing here. Once per main request.
+     * waf_status keeps paying nothing here. Counted on every main-request pass,
+     * including each internal-redirect hop, like the other counters above.
      */
     if (sh != NULL) {
-        ngx_http_heavybag_ua_parse(r, wlcf, ctx);        /* sets ctx->ua_category */
-        ngx_http_heavybag_ua_spoof_eval(r, wlcf, ctx);   /* sets ctx->is_spoofed  */
+        /* spoof_eval runs the descriptive parse itself, setting ctx->ua_category */
+        ngx_http_heavybag_ua_spoof_eval(r, wlcf, ctx);   /* sets ctx->is_spoofed */
 
         if ((ngx_uint_t) ctx->ua_category < HEAVYBAG_CAT_MAX) {
             (void) ngx_atomic_fetch_add(&sh->http_ua_cat[ctx->ua_category], 1);
