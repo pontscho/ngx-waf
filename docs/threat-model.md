@@ -283,7 +283,7 @@ covered set (every vector the WAF blocks today), not top-N.
 
 The procedure (reproducible, core-perl + nginx only — **no docker**):
 
-1. **Freeze** (`tests/corpus/freeze-regression-fixture.pl`, run once against a
+1. **Freeze** (`tools/freeze-regression-fixture.pl`, run once against a
    live regression-nginx): a two-pass probe per dimension. The *detect* vhost
    yields the authoritative `X-WAF-Reason`; a vector is frozen iff its reason
    != `none`. The *enforce* vhost then yields the real HTTP status. Frozen

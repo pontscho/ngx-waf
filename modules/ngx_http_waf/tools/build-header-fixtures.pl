@@ -38,14 +38,14 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 
 # --------------------------------------------------------------------------
-# paths (defaults derived from this script's location in tests/corpus/)
+# paths (script lives in tools/; defaults target ../tests/corpus/ + ../lists/)
 # --------------------------------------------------------------------------
 my $here   = dirname(__FILE__);
 my %opt = (
-    corpus => $here,                 # where the replay-*-vectors.jsonl live
-    raw    => "$here/fixtures/raw",   # external pulls
-    lists  => "$here/../../lists",    # the module's classifier lists
-    out    => "$here/fixtures",       # fixture output dir
+    corpus => "$here/../tests/corpus",              # where the replay-*-vectors.jsonl live
+    raw    => "$here/../tests/corpus/fixtures/raw", # external pulls
+    lists  => "$here/../lists",                     # the module's classifier lists
+    out    => "$here/../tests/corpus/fixtures",     # fixture output dir
 );
 while (@ARGV) {
     my $a = shift @ARGV;

@@ -54,15 +54,15 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 
 # --------------------------------------------------------------------------
-# paths / options (defaults derived from this script's location in corpus/)
+# paths / options (script lives in tools/; defaults target ../tests/corpus/)
 # --------------------------------------------------------------------------
 my $here   = dirname(__FILE__);
 my %opt = (
     host   => '127.0.0.1',
     perl   => $^X,                       # the running interpreter
-    client => "$here/../replay-client.pl",
-    corpus => $here,
-    tmp    => "$here/.freeze-tmp",
+    client => "$here/../tests/replay-client.pl",
+    corpus => "$here/../tests/corpus",
+    tmp    => "$here/../tests/corpus/.freeze-tmp",
 );
 while (@ARGV) {
     my $a = shift @ARGV;

@@ -893,12 +893,12 @@ regression fixtures · geo/ASN tuning).
 tracked); all derived artifacts are IP-free and gitignored under
 `modules/ngx_http_waf/tests/corpus/`. The committable, core-perl tools are:
 
-- **`tests/corpus/extract-replay-vectors.pl`** — single read-only pass over the
+- **`tools/extract-replay-vectors.pl`** — single read-only pass over the
   capture → the deduplicated, §3-class-labelled `replay-vectors.jsonl` attack
   vector set (+ `replay-vectors.summary.txt` sanity gate). `--ua-vectors` /
   `--referer-vectors` additionally emit the raw User-Agent / Referer header
   feeds (the only request headers the combined log preserves).
-- **`tests/corpus/build-header-fixtures.pl`** — assembles the per-dimension
+- **`tools/build-header-fixtures.pl`** — assembles the per-dimension
   replay fixtures (UA / Referer / Cookie / fake-bot) by merging the corpus
   feeds with the external threat-intel below and synthetic SQLi, sanitizing the
   uncurated lists (drop control bytes / comments, decode HTML entities).

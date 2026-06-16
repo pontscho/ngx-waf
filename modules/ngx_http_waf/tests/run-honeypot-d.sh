@@ -29,6 +29,7 @@ set -u
 
 ROOT=/mnt/nvme/imaginarium/openresty
 CORPUS=$ROOT/modules/ngx_http_waf/tests/corpus
+TOOLS=$ROOT/modules/ngx_http_waf/tools
 SRC=$ROOT/reference/geolookup.c
 
 ACCESS_LOG=${ACCESS_LOG:-$ROOT/ngxlogs/access.log}
@@ -69,7 +70,7 @@ echo
 echo "--- extract per-IP volume feed ---"
 SCRATCH=$(mktemp -d /tmp/honeypot-d.XXXXXX)
 trap 'rm -rf "$SCRATCH"' EXIT
-perl "$CORPUS/extract-replay-vectors.pl" \
+perl "$TOOLS/extract-replay-vectors.pl" \
     --in "$ACCESS_LOG" \
     --outdir "$SCRATCH" \
     --ip-volume \
@@ -81,7 +82,7 @@ echo
 # 3. join volume × geo, emit report + paste-ready candidates
 # ---------------------------------------------------------------------------
 echo "--- generate report ---"
-perl "$CORPUS/honeypot-d-report.pl" \
+perl "$TOOLS/honeypot-d-report.pl" \
     --ip-volume "$IP_FEED" \
     --geodb     "$GEODB" \
     --geolookup "$GEOLOOKUP" \
