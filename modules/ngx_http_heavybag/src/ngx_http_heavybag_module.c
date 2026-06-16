@@ -1329,11 +1329,25 @@ ngx_http_heavybag_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->rep.flag_mask = prev->rep.flag_mask;
     }
 
-    /* a country whitelist without a geo database can never allow anyone */
-    if (conf->rep.allow_cc != NULL && conf->rep.geo_db == NULL) {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-            "waf_geo_whitelist is set but no waf_geo_db is configured; "
-            "every request will be treated as not whitelisted (404)");
+    /*
+     * Fail-closed: any geo-dependent deny policy needs a geo database to work.
+     * Without one the reputation check silently fails open (allows everyone),
+     * so the protection would be configured yet inert -- and the operator would
+     * never find out. Refuse the config so it surfaces at "nginx -t", not after
+     * a silent bypass. (waf_blocklist / waf_allowlist are plain CIDR and need
+     * no geo database, so they are deliberately excluded.)
+     */
+    if (conf->rep.geo_db == NULL
+        && (conf->rep.block_cc != NULL
+            || conf->rep.allow_cc != NULL
+            || conf->rep.block_asn != NULL
+            || conf->rep.flag_cc != NULL
+            || conf->rep.flag_mask != 0))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "waf_geo_block / waf_geo_whitelist / waf_asn_block / waf_flag_block "
+            "require waf_geo_db, but no geo database is configured");
+        return NGX_CONF_ERROR;
     }
     if (conf->rep.blocklist == NULL) {
         conf->rep.blocklist = prev->rep.blocklist;

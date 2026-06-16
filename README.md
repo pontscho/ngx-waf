@@ -1145,8 +1145,12 @@ tracked); all derived artifacts are IP-free and gitignored under
 - Docker is not used in this environment; everything builds from source.
 - `waf_mail_backend` does not validate that the MTA is reachable — it only
   validates that the address is a numeric IP and the port is in range.
-- `waf_geo_whitelist` without a `waf_geo_db` denies everyone (every request
-  is "not whitelisted" → 404); a config-time warning is emitted in that case.
+- Any geo-dependent deny policy (`waf_geo_block`, `waf_geo_whitelist`,
+  `waf_asn_block`, `waf_flag_block`) **requires** `waf_geo_db`. Configuring one
+  without a geo database is a **hard config error** — `nginx -t` fails and nginx
+  refuses to start/reload — because a geo policy with no database would
+  silently fail open (allow everyone) and the gap would never surface.
+  (`waf_blocklist` / `waf_allowlist` are plain CIDR and need no geo database.)
 - The stream (L4) head does pure IP reputation — no UA, scanner-path, or
   spoofing logic (L4 has no headers or request line).
 

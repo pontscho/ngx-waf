@@ -341,11 +341,23 @@ ngx_stream_heavybag_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->rate_rules = prev->rate_rules;
     }
 
-    /* a country whitelist without a geo database can never allow anyone */
-    if (conf->rep.allow_cc != NULL && conf->rep.geo_db == NULL) {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-            "waf_geo_whitelist is set but no waf_geo_db is configured; "
-            "every connection will be treated as not whitelisted");
+    /*
+     * Fail-closed: a geo-dependent deny policy with no geo database silently
+     * fails open (allows every connection), so the L4 protection would be
+     * configured yet inert. Refuse the config at "nginx -t" rather than let it
+     * bypass silently. (blocklist / allowlist are plain CIDR -- no geo db.)
+     */
+    if (conf->rep.geo_db == NULL
+        && (conf->rep.block_cc != NULL
+            || conf->rep.allow_cc != NULL
+            || conf->rep.block_asn != NULL
+            || conf->rep.flag_cc != NULL
+            || conf->rep.flag_mask != 0))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "waf_geo_block / waf_geo_whitelist / waf_asn_block / waf_flag_block "
+            "require waf_geo_db, but no geo database is configured");
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -389,17 +401,44 @@ ngx_stream_heavybag_init(ngx_conf_t *cf)
     }
 
     /*
-     * Resolve (never create) the HTTP head's per-IP rate-limit zone, size 0,
-     * same as the status zone. Stays NULL if http{} declared no waf_rate_zone
-     * -> ngx_http_heavybag_rate_check fail-opens.
+     * Resolve (never create) the HTTP head's per-IP rate-limit zone.
+     * Unlike the waf_status zone, waf_rate is optional -- it only exists if
+     * http{} contains a waf_rate_zone directive.  ngx_shared_memory_add with
+     * size=0 would create a new zero-size entry when the zone is absent, and
+     * nginx then fatally rejects a zero-size zone at startup.  Instead walk the
+     * already-registered shared-memory list and set the pointer only when the
+     * zone has already been registered by the HTTP head; leave it NULL otherwise
+     * so the stream rate-check simply fail-opens.
      */
     {
-        ngx_str_t  name = ngx_string("waf_rate");
+        ngx_str_t         name = ngx_string("waf_rate");
+        ngx_uint_t        i;
+        ngx_list_part_t  *part;
+        ngx_shm_zone_t   *zone;
 
-        ngx_stream_heavybag_rate_zone = ngx_shared_memory_add(cf, &name, 0,
-                                                       &ngx_http_heavybag_module);
-        if (ngx_stream_heavybag_rate_zone == NULL) {
-            return NGX_ERROR;
+        ngx_stream_heavybag_rate_zone = NULL;
+
+        part = &cf->cycle->shared_memory.part;
+        zone = part->elts;
+
+        for (i = 0; /* void */; i++) {
+
+            if (i >= part->nelts) {
+                if (part->next == NULL) {
+                    break;
+                }
+                part = part->next;
+                zone = part->elts;
+                i = 0;
+            }
+
+            if (zone[i].shm.name.len == name.len
+                && ngx_strncmp(zone[i].shm.name.data, name.data, name.len) == 0
+                && zone[i].tag == &ngx_http_heavybag_module)
+            {
+                ngx_stream_heavybag_rate_zone = &zone[i];
+                break;
+            }
         }
     }
 
