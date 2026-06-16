@@ -33,6 +33,86 @@ dead rules) with compiled, anchored, hot-reloadable rules.
   live in a shared `ngx_heavybag_rep_conf_t` embedded in each head's config.
 
 
+## Architecture
+
+One `.so` carries **two** nginx modules (HTTP + stream) plus the mail
+`auth_http` content handler. All three entry points ("heads") converge on the
+*same* `reputation_check`; the HTTP head adds the request-aware layers (UA
+classification, request-field signatures, UA parsing, JA4, fingerprint
+spoofing) on top. The geo DB and the two shm zones are the only shared state.
+
+```mermaid
+flowchart TB
+    subgraph ingress["Ingress"]
+        H["HTTP / HTTPS / H3 client"]
+        M["SMTP client (ngx_mail proxy)"]
+        L["Raw TCP / UDP client"]
+    end
+
+    subgraph so["ngx_http_heavybag_module.so — one .so, two nginx modules + mail handler"]
+        direction TB
+
+        subgraph httph["HTTP head — ngx_http_heavybag_module"]
+            direction TB
+            PR["POST_READ<br/>canonical client IP (XFF from trusted_proxy)"]
+            PA["PREACCESS (cheap → expensive)<br/>reputation → method → UA class → scanner/args/cookie/referer"]
+            CT["CONTENT<br/>waf_status endpoint · mail auth_http"]
+            FLT["header + body filter (process-wide)<br/>Server-token spoof · Apache error pages"]
+            PR --> PA --> CT --> FLT
+        end
+
+        subgraph streamh["STREAM head — ngx_stream_heavybag_module"]
+            SA["ACCESS<br/>peer-IP reputation (no XFF at L4)"]
+        end
+
+        REP{{"reputation_check — heavybag_reputation.c<br/>allow ▸ block ▸ geo-miss ▸ flag ▸ asn ▸ flag_cc ▸ country"}}
+
+        subgraph httponly["HTTP-only request layers"]
+            UA["UA classify + $waf_ua_* parse<br/>heavybag_match.c · heavybag_ua_parse.c"]
+            SIG["scanner / args / cookie / referer<br/>PCRE2 action buckets — heavybag_match.c"]
+            JA4["JA4 fingerprint + spoof signal<br/>heavybag_ja4.c · heavybag_spoof.c"]
+        end
+    end
+
+    subgraph state["Shared / config-time state"]
+        GEO[("location.db<br/>mmap RO + ECDSA P-521 verify<br/>heavybag_geo.c")]
+        CIDR["allow / block / trusted-proxy CIDR<br/>verified-bot ranges"]
+        RATEZ[["rate shm zone — heavybag_rate.c<br/>lock-free per-IP token bucket"]]
+        STATZ[["stats shm zone — heavybag_status.c<br/>atomic counters"]]
+    end
+
+    H --> PR
+    M --> CT
+    L --> SA
+
+    PA --> REP
+    CT -- "auth_http only" --> REP
+    SA --> REP
+    PA -.-> UA
+    PA -.-> SIG
+    PA -.-> JA4
+
+    REP --> GEO
+    REP --> CIDR
+    PA --> RATEZ
+    SA --> RATEZ
+    CT --> RATEZ
+    PA -. bump .-> STATZ
+    SA -. bump .-> STATZ
+    CT -. read .-> STATZ
+```
+
+- **Solid arrows** are the per-request control path; **dotted arrows** are the
+  request-aware data layers and the shm-counter side effects.
+- The **shared core** (`reputation_check`) is stateless across workers: every
+  list/pattern resolves at config time, the geo DB is `mmap`'d read-only
+  (fork copy-on-write), and the only writable shared state is the two shm zones
+  (rate + stats), both lock-free.
+- The **HTTP-only layers** never run at L4 (no headers / request line) and the
+  mail head is pure IP reputation (+ rate limit) — see the per-head sections
+  below.
+
+
 ## Repository layout
 
 ```
@@ -41,25 +121,35 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 ├── cmake/Versions.cmake         pinned PKG_* versions, URLs, SHA256 hashes
 ├── modules/ngx_http_heavybag/        the dynamic module
 │   ├── config                   nginx addon build descriptor (one .so, 2 modules)
-│   ├── lists/                   path & UA signature lists (hot-reloadable)
-│   │   ├── scanners.list           scanner path patterns -> 403/404
+│   ├── lists/                   path/field & UA signature lists (hot-reloadable)
+│   │   ├── scanners.list           scanner path patterns   -> 404/403/444
+│   │   ├── args.list               query-string signatures -> $waf_reason=args
+│   │   ├── cookie.list             Cookie-header signatures -> $waf_reason=cookie
+│   │   ├── referer.list            Referer-header sigs     -> $waf_reason=referer
 │   │   ├── scanner-ua.list         security tools  -> $waf_type=scanner
 │   │   ├── ai-crawler.list         LLM/AI crawlers -> $waf_type=ai-crawler
 │   │   ├── crawler.list            search engines  -> $waf_type=crawler
-│   │   └── bot.list                social/monitor/HTTP libs -> $waf_type=bot
+│   │   ├── bot.list                social/monitor/HTTP libs -> $waf_type=bot
+│   │   ├── ja4.list                JA4 -> coarse TLS family (spoof signal)
+│   │   └── verified-crawler.list   published crawler CIDRs (fake-bot check)
 │   └── src/
-│       ├── ngx_http_heavybag_module.c  HTTP module glue: directives, phases, merge
+│       ├── ngx_http_heavybag_module.c  HTTP module glue: directives, phases, merge, $waf_* vars
 │       ├── ngx_http_heavybag.h         shared HTTP types / loc_conf
-│       ├── heavybag_match.{c,h}         scanner regex buckets + UA classification
+│       ├── ngx_http_heavybag_ua_enums.h  UA enum -> string tables
+│       ├── heavybag_match.{c,h}         scanner/args/cookie/referer regex buckets + UA classification
+│       ├── heavybag_ua_parse.{c,h}      descriptive UA parser ($waf_ua_* variables)
 │       ├── heavybag_spoof.{c,h}         Apache Server header + error-page spoof
-│       ├── heavybag_geo.{c,h}           IPFire location.db reader (embedded nanolibloc)
+│       ├── heavybag_geo.{c,h}           IPFire location.db reader (embedded nanolibloc) + ECDSA verify
+│       ├── heavybag_ja4.{c,h}           JA4 TLS fingerprint + spoof signal
 │       ├── heavybag_rep.h               shared rep_conf + reputation prototypes
 │       ├── heavybag_reputation.{c,h}    shared reputation core + config helpers
+│       ├── heavybag_rate.{c,h}          lock-free per-IP token-bucket rate limiter
+│       ├── heavybag_status.{c,h}        lock-free statistics endpoint (plain/json/prometheus)
 │       ├── heavybag_authhttp.{c,h}      ngx_mail auth_http content handler
 │       └── heavybag_stream.c            ngx_stream_heavybag_module (L4 reputation head)
 ├── geodb/
 │   ├── location.db              IPFire location database (uncompressed)
-├── reference/                   nanolibloc.c (basis), loctest.c (geo oracle), locverify.c (signature oracle)
+├── reference/                   nanolibloc.c (basis), loctest.c (geo oracle), locverify.c (signature oracle), geolookup.c (combined geo+sig oracle)
 ├── sandbox/                     runnable test env AND the build install prefix
 │   ├── nginx.conf               full HTTP + mail example config   (tracked)
 │   ├── certs/                   self-signed test cert/key          (tracked)
@@ -188,6 +278,9 @@ variable, independent of `waf` / `waf_bot_block`.
 | `waf` | `off`\|`detect`\|`enforce` (alias `on`) | `enforce` | Mode for the HTTP `POST_READ` + `PREACCESS` handlers (reputation, UA block, scanner, method, ASN). `off` skips them; `enforce` (and the back-compat alias `on`) blocks; **`detect`** runs every check but **never blocks** — it lets the request through (`NGX_DECLINED`) and bumps the `would_block[reason]` counters instead, so you can size a policy before enforcing it. **Fail-closed (CWE-636):** an *unset* `waf` now defaults to **`enforce`** (it used to be `off`), and any value other than `off`/`detect` takes the blocking path. Does **not** gate spoofing or `$waf_type` classification. |
 | `waf_bot_block` | `on`\|`off` | `off` | Block only **hostile** User-Agents: `scanner` tools and empty/missing UA (→ 404). `crawler`/`ai-crawler`/`bot` are classified into `$waf_type` but **never** blocked by this flag. |
 | `waf_scanner_list` | `<path>` | — | Load scanner **path** patterns from a file (compiled into action buckets). |
+| `waf_args_list` | `<path>` | — | Signature patterns matched against the **query string** (`r->args`, %-decoded). Same action-bucketed file format as `waf_scanner_list` (`404`/`403`/`444`) → `$waf_reason=args`. Hot-reloadable. |
+| `waf_cookie_list` | `<path>` | — | Signature patterns matched against **every `Cookie`** request header → `$waf_reason=cookie`. Same file format; hot-reloadable. |
+| `waf_referer_list` | `<path>` | — | Signature patterns matched against the **`Referer`** header (%-decoded) → `$waf_reason=referer`. Same file format; hot-reloadable. Evaluated after the scanner path, in order args → cookie → referer (first hit wins). |
 | `waf_scanner_ua_list` | `<path>` | — | UA signatures for security tools → `$waf_type=scanner`. |
 | `waf_ai_crawler_list` | `<path>` | — | UA signatures for LLM/AI crawlers → `$waf_type=ai-crawler`. |
 | `waf_crawler_list` | `<path>` | — | UA signatures for search-engine/archival crawlers → `$waf_type=crawler`. |
@@ -232,6 +325,10 @@ One PCRE2 pattern per line, with an optional trailing action token:
   `444` → `NGX_HTTP_CLOSE` (drop the connection).
 - The file is **hot-reloadable**: `nginx -s reload` re-reads and recompiles
   it; the old regex is freed with the old config pool.
+- The **same file format** (including the `404`/`403`/`444` action tokens)
+  applies to the request-field signature lists `waf_args_list` /
+  `waf_cookie_list` / `waf_referer_list` — they match the query string / the
+  `Cookie` header(s) / the `Referer` header (each %-decoded) instead of the URI.
 
 Example:
 
@@ -376,7 +473,7 @@ all active):
 |---|---|
 | `$waf_country` | The client's ISO-3166 two-letter geo country (or an IPFire special A1/A2/A3/T1/XD). Resolves to *not found* (`-` in logs) when no geo record exists or `waf_geo_db` is unset. |
 | `$waf_asn` | The client's autonomous-system number (decimal) from the geo DB. *Not found* (`-`) when `asn==0`, no record, or `waf_geo_db` is unset. Shares the per-request geo lookup, so it costs no extra DB hit. |
-| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`, `asn`, `method`, `args`, `cookie`, `referer`, `fake_bot`. In `detect` mode it carries the *would-be* reason. |
+| `$waf_reason` | The verdict token: `none` (allowed), `allowlist`, `blocklist`, `geo`, `geo_whitelist`, `flag`, `scanner_ua`, `empty_ua`, `scanner_path`, `asn`, `method`, `args`, `cookie`, `referer`, `fake_bot`, `rate_limit`. In `detect` mode it carries the *would-be* reason. |
 | `$waf_ja4_hash` | The [JA4](https://github.com/FoxIO-LLC/ja4) TLS client fingerprint (`t13d1516h2_…_…`), computed at the TLS handshake. **Observability only — never blocks.** *Not found* on plain HTTP / non-TLS. Works for TCP-TLS (HTTP/1.1, H2) and QUIC/H3 (the `q…` form). |
 
 ```nginx
@@ -398,7 +495,7 @@ injection into a log or response-header sink).
 
 | Variable | Value |
 |---|---|
-| `$waf_ua_browser` | Browser/client family: `chrome`, `firefox`, `safari`, `edge`, `opera`, `operagx`, `yabrowser`, `samsung`, `vivaldi`, `headlesschrome`, `duckduckgo`, `huaweibrowser`, `ucbrowser`, `whale`, `curl`, `wget`, `ffmpeg`, `python`, `gohttp`, `java`, `okhttp`, … (`unknown` if none matched). Chromium-derivative tokens are detected **before** the bare `Chrome/` token. Brave/Arc ship a Chrome-identical UA and are reported as `chrome` (undetectable server-side). |
+| `$waf_ua_browser` | Browser/client family: `chrome`, `firefox`, `safari`, `edge`, `opera`, `operagx`, `yabrowser`, `samsung`, `vivaldi`, `headlesschrome`, `duckduckgo`, `huaweibrowser`, `ucbrowser`, `whale`, `msie`, `xiaomibrowser`, `sleipnir`, `androidbrowser`, `silk`, `curl`, `wget`, `ffmpeg`, `applecoremedia`, `libmpv`, `python`, `gohttp`, `java`, `okhttp` (`unknown` if none matched). Chromium-derivative tokens are detected **before** the bare `Chrome/` token. Brave/Arc ship a Chrome-identical UA and are reported as `chrome` (undetectable server-side). |
 | `$waf_ua_browser_version` | The version token following the browser marker (e.g. `120.0.0.0`). *Not found* (`-`) when absent. Chromium froze the minor/patch at `0.0.0`, so only the major is reliable for Chromium browsers. |
 | `$waf_ua_category` | Device class `mobile`/`tablet`/`pc`/`tv`/`console`, **overridden** by the threat class `scanner`/`ai-crawler`/`crawler`/`bot` when `$waf_type` matched one. `unknown` otherwise. |
 | `$waf_ua_vendor` | `apple`/`google`/`microsoft`/`mozilla`/`yandex`/`samsung`/`opera`/`huawei`/`naver`/`duckduckgo`/… plus crawler-vendor attribution (Googlebot→`google`, bingbot→`microsoft`, Baiduspider→`baidu`, …). `unknown` otherwise. |
@@ -478,7 +575,12 @@ the first deny wins):
    both block and whitelist modes.
 5. **ASN** match (`waf_asn_block`) → 403 (`asn`). `asn==0` / no record fails
    open. Applies in both block and whitelist modes.
-6. **geo country**:
+6. **special-source country** match → 403 (`network flag`). The IPFire special
+   codes that `waf_flag_block` maps from network flags (A1/A2/A3/T1/XD — see
+   the mapping below) are matched here against the source CC, **before** the
+   country decision and in **both** block and whitelist modes — so a flagged
+   source is denied even from an otherwise-whitelisted country.
+7. **geo country**:
    - **block mode** (`waf_geo_block`): country in the block list → 403
      (`geo country`).
    - **whitelist mode** (`waf_geo_whitelist`, which *wins* when set): country
@@ -542,7 +644,7 @@ request header (the real SMTP peer, injected by `ngx_mail` from
 
 - **Allow:** `Auth-Status: OK` + `Auth-Server`/`Auth-Port` (from
   `waf_mail_backend`). Both are mandatory; if `waf_mail_backend` is unset the
-  response is sent without them and a warning is logged, so `ngx_mail` rejects
+  response is sent without them and an error is logged, so `ngx_mail` rejects
   the session.
 - **Deny:** `Auth-Status: <reason>` — `ngx_mail` prepends its SMTP error
   code, e.g. `535 5.7.0 static blocklist`.
@@ -554,6 +656,11 @@ request header (the real SMTP peer, injected by `ngx_mail` from
   peer is judged instead, with a warning — so a wrongly-exposed endpoint cannot
   be steered by a spoofed `Client-IP`. This is why the endpoint must stay bound
   to `127.0.0.1`.
+- **Rate limit:** the mail head also runs the shared per-IP token-bucket
+  limiter — any `waf_rate_limit` rule on the auth `location` applies. Over the
+  limit it answers `Auth-Status: rate limit` and bumps the same
+  `http_blocked_rate_limit` / `http_resp_429` counters as the HTTP head.
+  Requires a `waf_rate_zone` declared in `http{}` (else it fail-opens).
 
 **Critical:** the `auth_http` `location` must be on a server/location with
 `waf off`. Otherwise the HTTP `PREACCESS` handler runs against the
@@ -751,6 +858,14 @@ The `asn` and `method` reasons render automatically in every per-reason loop
 `--with-http_stub_status_module`, the core connection table
 (`active`/`reading`/`writing`/`accepted`/…) is re-exported too.
 
+**Metric names differ by format.** The `plain` output uses flat keys
+(`http_requests`, `http_resp_429`, `http_blocked_blocklist`, …); `prometheus`
+uses labelled metric families (`heavybag_http_requests_total`,
+`heavybag_http_responses_total{code="429"}`,
+`heavybag_http_blocked_total{reason="blocklist"}`, …); `json` nests the same
+counters under typed objects. The per-reason set (including `asn`, `method`,
+`rate_limit`) renders automatically in all three.
+
 All attacker-influenceable bytes (geo-DB country codes, `server_name` values)
 are **escaped unconditionally** at the serializer boundary — JSON per RFC 8259,
 Prometheus label values per the text-exposition rules — so a hostile geo
@@ -947,6 +1062,14 @@ the embedded reader came from and how it is validated:
 - **`reference/loctest.c`** — a standalone geo oracle: it resolves IPs against
   `location.db` independently of nginx, used to cross-check the module's
   country / network-flag lookups during development.
+- **`reference/locverify.c`** — a standalone signature oracle: it reproduces
+  libloc's ECDSA P-521 / SHA-512 database verification independently of nginx,
+  used to cross-check `heavybag_geo.c`'s load-time signature check.
+- **`reference/geolookup.c`** — a standalone IP → CC/ASN/flags resolver (the
+  *fixed* radix-trie walk ported from `heavybag_geo.c`), printing one TSV line
+  per IP from stdin. Built for the honeypot work-stream D offline ASN/geo
+  tuning; signature verification is deliberately skipped (offline analysis of
+  an already-trusted local DB), so it stays libc-only (no `-lcrypto`).
 
 The seed UA signature lists in `modules/ngx_http_heavybag/lists/` were distilled
 from these public catalogues (all permissively licensed); refresh against them
