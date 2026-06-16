@@ -1,0 +1,20 @@
+# ngx_http_heavybag_module - query-string (args) signature blocklist
+#
+# Format: one PCRE2 pattern per line, optional trailing action token.
+#   <pattern>[ <action>]      action in { 404 (default), 403, 444 }
+#
+# Patterns are matched case-insensitively against the %-decoded query string
+# (r->args). SQLi/XSS probes are the primary target. Patterns sharing an
+# action are compiled into one alternation regex; this file is hot-reloadable.
+
+# ---- SQL injection ---------------------------------------------------------
+union\s+select       403
+'\s*union             404
+\bor\s+1\s*=\s*1\b   403
+
+# ---- XSS -------------------------------------------------------------------
+<script              444
+javascript:          444
+
+# ---- PHP RCE ---------------------------------------------------------------
+php://input          444

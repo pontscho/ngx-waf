@@ -1,0 +1,15 @@
+# ngx_http_heavybag_module - verified-crawler published CIDR allowlist (TEST FIXTURE)
+#
+# Plain "addr/prefix" per line; '#' comment and blank lines are skipped. In
+# production this file is produced offline by a cron job that converts a crawler
+# operator's published JSON range (e.g. Google's googlebot.json) into one CIDR
+# per line -- the WAF never parses JSON or does DNS. A request classified as
+# $waf_type=crawler whose canonical client IP is NOT in any range below is
+# treated as a fake bot (403) when waf_fake_bot_block is on.
+#
+# These are RFC 5737 / RFC 3849 documentation ranges, never real prefixes, so
+# the loopback test peer (127.0.0.1) is deliberately OUT of range.
+
+203.0.113.0/24
+198.51.100.0/24
+2001:db8::/32

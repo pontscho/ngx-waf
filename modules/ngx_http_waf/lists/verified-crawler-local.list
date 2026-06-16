@@ -1,6 +1,0 @@
-# ngx_http_waf_module - verified-crawler allowlist that INCLUDES the loopback
-# test peer (TEST FIXTURE). Used to prove the in-range path: a crawler UA from
-# 127.0.0.1 is verified against the published range and allowed through (200).
-
-127.0.0.1/32
-::1/128

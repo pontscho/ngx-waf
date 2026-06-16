@@ -1,0 +1,54 @@
+# ngx_http_heavybag_module - social / monitor / feed / HTTP-library User-Agent sigs
+#
+# $waf_type = bot. Flag-only: surfaced for the operator, never blocked by
+# waf_bot_block. Covers link-preview unfurlers, SEO/monitoring bots, feed
+# readers and generic HTTP client libraries. One case-insensitive PCRE2
+# fragment per line; regex metacharacters ('/', '^', '.') are significant.
+#
+# NEVER add a bare 'bot'/'spider'/'crawl'/'Mozilla' token: massive false
+# positives. Keep tokens to distinctive product / library names.
+
+# -- social / link-preview unfurlers ----------------------------------------
+facebookexternalhit
+Twitterbot
+LinkedInBot
+Slackbot
+Discordbot
+TelegramBot
+redditbot
+
+# -- SEO / monitoring -------------------------------------------------------
+AhrefsBot
+SemrushBot
+MJ12bot
+dotbot
+UptimeRobot
+Pingdom
+Feedly
+
+# -- generic HTTP client libraries ------------------------------------------
+python-requests
+Go-http-client
+curl/
+^Java/
+okhttp
+axios
+Scrapy
+libwww-perl
+Wget
+Apache-HttpClient
+
+# -- 2026 curated additions -------------------------------------------------
+hey/
+WhatsApp
+Pinterestbot
+StatusCake
+Site24x7
+Chrome-Lighthouse
+python-httpx
+aiohttp
+Python-urllib
+GuzzleHttp
+node-fetch
+undici
+reqwest

@@ -1,0 +1,15 @@
+# ngx_http_heavybag_module - Cookie header signature blocklist
+#
+# Format: one PCRE2 pattern per line, optional trailing action token.
+#   <pattern>[ <action>]      action in { 404 (default), 403, 444 }
+#
+# Patterns are matched case-insensitively against each %-decoded Cookie
+# request header value (a client may send several). Patterns sharing an
+# action compile into one alternation regex; this file is hot-reloadable.
+
+# ---- scanner / tool fingerprints in cookies --------------------------------
+sqlmap               404
+acunetix             403
+
+# ---- obvious injection attempts in cookie values ---------------------------
+<script              444

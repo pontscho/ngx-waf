@@ -3,14 +3,14 @@
 **Status:** living document · **Audience:** module authors + edge operators
 **Data source:** `ngxlogs/access.log` + `error.log` — the real production logs of
 this edge (`203.0.113.10`, `example.com`), **1,651,507 HTTP requests over
-~3 years 10 months** (2022-08-22 → 2026-06-13), captured **before** the WAF was
+~3 years 10 months** (2022-08-22 → 2026-06-13), captured **before** heavybag was
 ever enforcing. Every number below is measured directly from that corpus.
 
-> **Why this matters.** The WAF's rule set is not guessed — it is *fitted to
+> **Why this matters.** The heavybag's rule set is not guessed — it is *fitted to
 > this edge's actual attack surface*. This document records what the edge
 > really sees, how we derive rules from it, and the test program that keeps the
 > rules honest as traffic evolves. It is the empirical backing for
-> [`modules/ngx_http_waf/lists/scanners.list`](../modules/ngx_http_waf/lists/scanners.list)
+> [`modules/ngx_http_heavybag/lists/scanners.list`](../modules/ngx_http_heavybag/lists/scanners.list)
 > and for the geo/reputation tuning.
 
 ---
@@ -22,7 +22,7 @@ ever enforcing. Every number below is measured directly from that corpus.
 | Total requests | 1,651,507 |
 | Distinct source IPs | 79,192 |
 | Span | 2022-08-22 → 2026-06-13 (~3y 10m) |
-| Nature | **pre-WAF** — the legacy backend / catch-all answered everything |
+| Nature | **pre-heavybag** — the legacy backend / catch-all answered everything |
 
 **This is a pure internet-scan profile.** The host is a small edge with no
 organic user base for any of the probed resources; effectively all non-trivial
@@ -60,7 +60,7 @@ must assume scan volume keeps climbing.
 
 Two operational facts fall out of this:
 
-- **The backend was already absorbing scans as 404** (36.5%). The WAF's job is
+- **The backend was already absorbing scans as 404** (36.5%). The heavybag's job is
   not to invent rejection — it is to reject *earlier and cheaper* (at
   `PREACCESS`, before proxying), to hide the fingerprint, and to feed reputation.
 - **nginx logs a dropped connection as `499`, not `444`.** The `444` action in
@@ -138,7 +138,7 @@ method token itself being binary or another protocol's banner:
 | — | SMB negotiate, WebLogic `t3`, Java `JRMI`, DNS `version.bind`, Gh0st/njRAT/Stratum beacons | misc L4 / malware |
 
 **Architectural consequence (decided):** this vector is **not reachable from the
-WAF's HTTP phases** — nginx kills it at the request-line parser, so it never
+heavybag's HTTP phases** — nginx kills it at the request-line parser, so it never
 reaches `POST_READ`/`PREACCESS`. It is already "handled" (400 + connection torn
 down, backend never sees it). It surfaces only in `error.log`
 (`client sent invalid method` 61,964; `invalid request` 15,584;
@@ -146,7 +146,7 @@ down, backend never sees it). It surfaces only in `error.log`
 an HTTP-layer classifier for it: an `error_page 400` / log-phase counter would
 be a hack for no operational gain, and an L4 first-byte sniffer is a separate,
 larger capability we are not pursuing now. *Documented as a known,
-parser-handled class — no WAF action required.*
+parser-handled class — no heavybag action required.*
 
 ---
 
@@ -231,7 +231,7 @@ shellshock `/bin/sh` traversal tail, and a `php://input` **args** signature
 `secrets.json`, `appsettings.json`, `*.env`, Docker `/containers/json`, Apache
 `/server-status`, Druid) that lifted the `uncatalogued` class 14.1% → 21.6%.
 **Action note:** the generic `.php` rule lands in the 404 bucket, and the
-lookup checks 404 before 403/444 (`waf_match.c` `scanner_lookup`), so ~46
+lookup checks 404 before 403/444 (`heavybag_match.c` `scanner_lookup`), so ~46
 phpmyadmin/pma paths that end in `.php` now return **404 instead of 403** — they
 stay blocked, just blended into the backdrop 404s (the §2 "hide the fingerprint"
 goal). The phpmyadmin/pma *directory* probes keep their 403.
@@ -263,7 +263,7 @@ so the re-freeze grew only the 404 bucket (403/444 byte-identical).
 ### B — Detect-mode FP/TP replay (done)
 
 Validate a policy *before* enforcing it. Replay the corpus against the sandbox
-WAF in `waf detect;` mode and read the `would_block[reason]` counters:
+heavybag in `waf detect;` mode and read the `would_block[reason]` counters:
 
 - **FP set** — the legitimate baseline (`/`, `/app.css`, `/app.json`,
   `/favicon.ico`, `/robots.txt`, `/sitemap.xml`): **must produce zero**
@@ -279,7 +279,7 @@ The detect-mode coverage from B is distilled into a **frozen, committed**
 fixture and asserted in **enforce** mode, so a future list edit that silently
 stops matching `/.env` or `/wp-login.php` — or changes its action
 (404↔403↔444) — fails the harness. Partner decision: the fixture is the FULL
-covered set (every vector the WAF blocks today), not top-N.
+covered set (every vector heavybag blocks today), not top-N.
 
 The procedure (reproducible, core-perl + nginx only — **no docker**):
 
@@ -297,7 +297,7 @@ The procedure (reproducible, core-perl + nginx only — **no docker**):
    a byte-0 connection close — no `X-WAF-Reason` reaches the wire) is asserted
    status-only; its reason stands frozen from generation time.
 
-The harness uses a dedicated config (`tests/waf-regression-test.conf`, ports
+The harness uses a dedicated config (`tests/heavybag-regression-test.conf`, ports
 283xx) with detect+enforce vhost pairs and **exactly one matcher per vhost**
 (PREACCESS is first-match-wins, so dimensions stay isolated); no `proxy_pass`,
 no `waf_trusted_proxy`, no rate/geo — the only verdict is the matcher under
@@ -316,7 +316,7 @@ intentionally changes coverage or an action bucket.) It complements the existing
 Where A/B/C tune **what** to block (paths, UAs, signatures), D tunes **whom** to
 block at the IP/network layer. It is **pure analysis → candidates**: it produces
 a report + paste-ready directive fragments for the partner to review and apply
-by hand. It writes no module `.c`, changes no list the WAF loads, and feeds only
+by hand. It writes no module `.c`, changes no list heavybag loads, and feeds only
 runtime levers that already exist (`waf_blocklist` / `waf_asn_block` /
 `waf_geo_block` / `waf_flag_block`).
 
@@ -325,7 +325,7 @@ The procedure (reproducible, read-only on the log, libc + core-perl only —
 
 1. **Resolve** (`reference/geolookup.c`): a standalone, libc-only IP →
    CC / ASN / flags reader, a faithful port of the **bounds-guarded** walk /
-   lookup in `modules/ngx_http_waf/src/waf_geo.c` (NOT `loctest.c`, which carries
+   lookup in `modules/ngx_http_heavybag/src/heavybag_geo.c` (NOT `loctest.c`, which carries
    the pre-fix geo-OOB bug — no `net*12+12 ≤ len[ND]` guard, and a `nxt*=12` that
    can wrap before its bounds check). Both `size_t` guards are preserved; the
    libloc signature verify is skipped (offline, locally-trusted DB → no
@@ -385,10 +385,10 @@ The levers, by surgical precision:
 
 ## 7. Limitations & caveats
 
-- **Pre-WAF corpus.** The WAF never enforced during capture; every `.php` 200
+- **Pre-heavybag corpus.** heavybag never enforced during capture; every `.php` 200
   (incl. the historic `/xleet-shell.php` hit) reflects the *old* backend /
-  catch-all, **not** a WAF bypass. The `/xleet-shell.php` 200 may indicate a
-  past compromise of the legacy infra — an infrastructure question, not a WAF
+  catch-all, **not** a heavybag bypass. The `/xleet-shell.php` 200 may indicate a
+  past compromise of the legacy infra — an infrastructure question, not a heavybag
   one.
 - **Signature, not content.** `scanners.list` matches paths; it cannot catch a
   random-named webshell (`/xleet-shell.php` is caught only by the `\.php`

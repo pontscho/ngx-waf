@@ -6,14 +6,14 @@ security-officer: REVISE — all findings folded in below) · **Scope:** threat-
 `docs/threat-intel-sources.md` (header fixtures).
 
 > **Path convention (inspector H1):** the test tree is
-> `modules/ngx_http_waf/tests/`, lists are `modules/ngx_http_waf/lists/`, the
-> corpus is `modules/ngx_http_waf/tests/corpus/`. All paths below use these.
+> `modules/ngx_http_heavybag/tests/`, lists are `modules/ngx_http_heavybag/lists/`, the
+> corpus is `modules/ngx_http_heavybag/tests/corpus/`. All paths below use these.
 
 ---
 
 ## 1. Goal & framing
 
-Replay the real corpus against the sandbox WAF in **`detect` mode** and read the
+Replay the real corpus against the sandbox heavybag module in **`detect` mode** and read the
 `http_would_block[reason]` counters, to produce two things per rule state:
 
 1. **FP gate** — the legit baseline set (`/`, `/app.*`, static, favicon/robots/
@@ -30,7 +30,7 @@ per-class hit-rate + an **uncovered-hostile list** that feeds the §6/A
 gap-analysis loop (the same loop that took path coverage 18.1% → 24.8%).
 
 ### In scope
-- A reusable **replay harness** (modelled on `modules/ngx_http_waf/tests/run-stat-tests.sh`).
+- A reusable **replay harness** (modelled on `modules/ngx_http_heavybag/tests/run-stat-tests.sh`).
 - A dimension-clean sandbox config for replay.
 - Path/args replay from `replay-vectors.jsonl` (all vectors — partner: "mind").
 - Header replay (UA / Referer / Cookie) from fixtures built off `docs/threat-intel-sources.md`.
@@ -48,7 +48,7 @@ gap-analysis loop (the same loop that took path coverage 18.1% → 24.8%).
 ## 2. The phase-order problem and the dimension-clean vhosts
 
 `would_block` records the **first** blocking phase. PREACCESS order (verified,
-`ngx_http_waf_module.c`): reputation (857) → method (891) → rate (927) → **UA-bot
+`ngx_http_heavybag_module.c`): reputation (857) → method (891) → rate (927) → **UA-bot
 (967) → fake-bot (996) → scanner-path (1018) → args (1063) → cookie (1082) →
 referer (1100)**; each hit `return`s immediately (first-match-wins). Consequences:
 
@@ -60,8 +60,8 @@ referer (1100)**; each hit `return`s immediately (first-match-wins). Consequence
 **Design:** one **dimension-isolated** detect vhost per matcher, only that matcher
 enabled, **`waf_bot_block off` on every non-UA vhost**, and the client sends a
 **benign UA** on every non-UA dimension (inspector M2). New self-contained config
-`modules/ngx_http_waf/tests/waf-replay-test.conf` (do NOT overload
-`waf-stat-test.conf`):
+`modules/ngx_http_heavybag/tests/heavybag-replay-test.conf` (do NOT overload
+`heavybag-stat-test.conf`):
 
 | vhost (port) | mode | enabled matcher | bot_block | fed by |
 |---|---|---|---|---|
@@ -75,7 +75,7 @@ enabled, **`waf_bot_block off` on every non-UA vhost**, and the client sends a
 
 All locations are **static-file-backed** so a *declined* request reaches CONTENT
 (200) — the proven pattern from the existing `detect.test` vhost
-(`waf-stat-test.conf:125`) + `run-stat-tests.sh:155-174`.
+(`heavybag-stat-test.conf:125`) + `run-stat-tests.sh:155-174`.
 
 **Security invariants baked into the conf (security-officer S1/S5):**
 - **No `proxy_pass` in any replay HTTP vhost** — static-file backing only, so a
@@ -101,11 +101,11 @@ the TCP socket to `127.0.0.1:<dimension-port>`, chosen by the harness, **never**
 derived from the vector. An absolute-form (`GET http://host/…`) or `CONNECT`
 request-line in the corpus is **skip-and-counted**, not sent (the extractor's URI
 regex permits absolute-form, `extract-replay-vectors.pl` URI token = `\S+`; the
-WAF matches `r->uri`, so authority-form adds no coverage).
+heavybag module matches `r->uri`, so authority-form adds no coverage).
 
 **Other critical client details:**
 - **Path on the wire is sent as-is** (raw socket writes the request-line
-  verbatim); `%2e`/`%0d%0a` stay percent-encoded — the *server* decodes (the WAF
+  verbatim); `%2e`/`%0d%0a` stay percent-encoded — the *server* decodes (the heavybag module
   matches decoded `r->uri`). Percent-encoded CRLF in the path is in-scope & safe.
 - **`\xNN` re-encoding + CRLF framing invariant (security-officer S3):** re-expand
   `\xNN` only **inside the single header value being placed**; write each header
@@ -125,7 +125,7 @@ WAF matches `r->uri`, so authority-form adds no coverage).
 ## 4. Header fixtures (the dimension with no corpus data)
 
 Build from `docs/threat-intel-sources.md`, staged under
-`modules/ngx_http_waf/tests/corpus/fixtures/` (gitignored derivatives):
+`modules/ngx_http_heavybag/tests/corpus/fixtures/` (gitignored derivatives):
 
 - **UA fixture:** raw UAs from the corpus regenerated **without** `--collapse-ua`
   (the collapse was a path-cardinality measure only), MERGED with OWASP CRS
@@ -150,8 +150,8 @@ in any emitted artifact — security-officer S4).
 
 ## 5. Reason mapping (the TP assertion table)
 
-Plain keys verified against `waf_status.c:224,241`. Reason labels are
-`waf_reason_str[]` (`ngx_http_waf_module.c:59-76`).
+Plain keys verified against `heavybag_status.c:224,241`. Reason labels are
+`waf_reason_str[]` (`ngx_http_heavybag_module.c:59-76`).
 
 | dimension / source | expected counter (plain key) | notes |
 |---|---|---|
@@ -165,7 +165,7 @@ Plain keys verified against `waf_status.c:224,241`. Reason labels are
 
 **Inspector C1 correction:** `http_scanner_path_{404,403,444}` action buckets do
 NOT increment in detect mode — the detect branch returns before the action
-`switch` (`ngx_http_waf_module.c:1021-1046`). Action-split is **enforce-only**;
+`switch` (`ngx_http_heavybag_module.c:1021-1046`). Action-split is **enforce-only**;
 detect gives the single aggregate `http_would_block_scanner_path`. The plan does
 NOT rely on action buckets.
 
@@ -174,7 +174,7 @@ asn, method, args, cookie, referer, fake_bot, rate_limit, blocklist, geo,
 geo_whitelist, flag, allowlist`.
 
 **Counter read + reset (inspector C2):** counters do NOT zero on `nginx -s
-reload` (the shm struct is re-used verbatim, `ngx_http_waf_module.c:2244-2248`).
+reload` (the shm struct is re-used verbatim, `ngx_http_heavybag_module.c:2244-2248`).
 The ONLY reset mechanism is **delta snapshots** — `getcnt` before, replay, `getcnt`
 after, assert on the delta (exactly `run-stat-tests.sh:40-46` `assert_delta`).
 There is no reload-reset path.
@@ -197,20 +197,20 @@ There is no reload-reset path.
 
 **Data handling (security-officer S4):** the FP/coverage reports and the
 uncovered-hostile export are **corpus derivatives → gitignored**, never committed,
-and contain **no `remote_addr`**. Only the harness script + `waf-replay-test.conf`
+and contain **no `remote_addr`**. Only the harness script + `heavybag-replay-test.conf`
 are committable.
 
 ---
 
 ## 7. Build/run rules
 
-- Sandbox nginx already built with the WAF `.so` (no `.c` change in B). If the
-  module must be rebuilt: cmake `--build --target waf_module`, mind the OpenSSL
+- Sandbox nginx already built with the heavybag `.so` (no `.c` change in B). If the
+  module must be rebuilt: cmake `--build --target heavybag_module`, mind the OpenSSL
   rebuild trap (touch `ssl.h` after reconfigure).
 - `purity` is the only file writer; `ngxlogs/` stays read-only; docker forbidden.
 - **No fixture/corpus byte ever reaches a shell word or a command line**
   (security-officer S2).
-- `modules/ngx_http_waf/tests/corpus/` derivatives (incl. B's reports + fixtures)
+- `modules/ngx_http_heavybag/tests/corpus/` derivatives (incl. B's reports + fixtures)
   stay gitignored; the harness script + replay conf ARE committable.
 
 ---
@@ -220,11 +220,11 @@ are committable.
 1. Extend `extract-replay-vectors.pl` with `--ua-vectors` / `--referer-vectors`
    (IP-free); regenerate the raw-UA vector set (no `--collapse-ua`).
 2. Pull + **sanitize** the external fixtures (CRS scanners-ua, SecLists UA,
-   bad-referrers) into `modules/ngx_http_waf/tests/corpus/fixtures/`.
-3. Write `modules/ngx_http_waf/tests/waf-replay-test.conf` (dimension-clean
+   bad-referrers) into `modules/ngx_http_heavybag/tests/corpus/fixtures/`.
+3. Write `modules/ngx_http_heavybag/tests/heavybag-replay-test.conf` (dimension-clean
    vhosts; no proxy_pass; loopback-only; no trusted_proxy).
 4. Write the **raw-socket perl replay client** + harness
-   `modules/ngx_http_waf/tests/run-replay-tests.sh` (delta snapshots; absolute-
+   `modules/ngx_http_heavybag/tests/run-replay-tests.sh` (delta snapshots; absolute-
    form skip+count; CRLF framing invariant).
 5. Run; produce FP report + coverage report + uncovered export (all gitignored).
 6. Hand the uncovered list to the §6/A loop (informs C's bounded fixture).

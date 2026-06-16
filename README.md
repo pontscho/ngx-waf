@@ -1,4 +1,4 @@
-# ngx_http_waf_module — an nginx edge firewall
+# ngx_http_heavybag_module — an nginx edge firewall
 
 A lean, fast **edge firewall** for vanilla nginx, built as a dynamic C module
 plus the stock `ngx_mail` proxy, sharing a single IP-reputation core. It is
@@ -29,8 +29,8 @@ dead rules) with compiled, anchored, hot-reloadable rules.
   stateless with respect to each other.
 - **One reputation engine, three heads.** The HTTP `PREACCESS` handler, the
   SMTP `auth_http` endpoint, and the stream (L4) `ACCESS` handler all call
-  the *same* `ngx_http_waf_reputation_check()` on the client IP. The inputs
-  live in a shared `ngx_waf_rep_conf_t` embedded in each head's config.
+  the *same* `ngx_http_heavybag_reputation_check()` on the client IP. The inputs
+  live in a shared `ngx_heavybag_rep_conf_t` embedded in each head's config.
 
 
 ## Repository layout
@@ -39,7 +39,7 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 .
 ├── CMakeLists.txt               super-build: fetch + build OpenSSL/zlib-ng/nginx
 ├── cmake/Versions.cmake         pinned PKG_* versions, URLs, SHA256 hashes
-├── modules/ngx_http_waf/        the dynamic module
+├── modules/ngx_http_heavybag/        the dynamic module
 │   ├── config                   nginx addon build descriptor (one .so, 2 modules)
 │   ├── lists/                   path & UA signature lists (hot-reloadable)
 │   │   ├── scanners.list           scanner path patterns -> 403/404
@@ -48,15 +48,15 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 │   │   ├── crawler.list            search engines  -> $waf_type=crawler
 │   │   └── bot.list                social/monitor/HTTP libs -> $waf_type=bot
 │   └── src/
-│       ├── ngx_http_waf_module.c  HTTP module glue: directives, phases, merge
-│       ├── ngx_http_waf.h         shared HTTP types / loc_conf
-│       ├── waf_match.{c,h}         scanner regex buckets + UA classification
-│       ├── waf_spoof.{c,h}         Apache Server header + error-page spoof
-│       ├── waf_geo.{c,h}           IPFire location.db reader (embedded nanolibloc)
-│       ├── waf_rep.h               shared rep_conf + reputation prototypes
-│       ├── waf_reputation.{c,h}    shared reputation core + config helpers
-│       ├── waf_authhttp.{c,h}      ngx_mail auth_http content handler
-│       └── waf_stream.c            ngx_stream_waf_module (L4 reputation head)
+│       ├── ngx_http_heavybag_module.c  HTTP module glue: directives, phases, merge
+│       ├── ngx_http_heavybag.h         shared HTTP types / loc_conf
+│       ├── heavybag_match.{c,h}         scanner regex buckets + UA classification
+│       ├── heavybag_spoof.{c,h}         Apache Server header + error-page spoof
+│       ├── heavybag_geo.{c,h}           IPFire location.db reader (embedded nanolibloc)
+│       ├── heavybag_rep.h               shared rep_conf + reputation prototypes
+│       ├── heavybag_reputation.{c,h}    shared reputation core + config helpers
+│       ├── heavybag_authhttp.{c,h}      ngx_mail auth_http content handler
+│       └── heavybag_stream.c            ngx_stream_heavybag_module (L4 reputation head)
 ├── geodb/
 │   ├── location.db              IPFire location database (uncompressed)
 ├── reference/                   nanolibloc.c (basis), loctest.c (geo oracle), locverify.c (signature oracle)
@@ -74,7 +74,7 @@ dead rules) with compiled, anchored, hot-reloadable rules.
 
 The toolchain is a **CMake super-build**. From a clean checkout it downloads
 version-pinned sources (OpenSSL, zlib-ng, nginx), builds them, and installs
-the nginx binary + WAF module into the runnable `sandbox/` tree — no vendored
+the nginx binary + heavybag module into the runnable `sandbox/` tree — no vendored
 trees, no manual `./configure` dance.
 
 ### Prerequisites
@@ -88,7 +88,7 @@ trees, no manual `./configure` dance.
     builds it in-tree via `--with-openssl=<src>`.
   - **zlib-ng 2.3.3** — built statically (`--zlib-compat --static`) and
     linked in place of the system dynamic zlib.
-  - **nginx 1.30.2** — configured with the full flag set and the WAF module
+  - **nginx 1.30.2** — configured with the full flag set and the heavybag module
     as a dynamic add-on.
 
 Versions/URLs/hashes are pinned in [`cmake/Versions.cmake`](cmake/Versions.cmake);
@@ -105,7 +105,7 @@ This installs, into the `sandbox/` tree (the nginx prefix), at stable
 repo-relative paths:
 
 - `sandbox/sbin/nginx` — the binary (OpenSSL 3.5.7 + static zlib-ng)
-- `sandbox/modules/ngx_http_waf_module.so` — the WAF dynamic module
+- `sandbox/modules/ngx_http_heavybag_module.so` — the heavybag dynamic module
 
 (`sandbox/` doubles as the build install prefix and the runnable test env;
 the generated `sbin/`, `modules/`, `conf/`, `logs/`, `*_temp/` are gitignored,
@@ -123,11 +123,11 @@ Day-to-day module edits should not re-run the whole chain. After the first
 full build, rebuild just the `.so` and refresh `sandbox/modules/` with:
 
 ```sh
-cmake --build build --target waf_module
+cmake --build build --target heavybag_module
 ```
 
 It runs `make modules` in the already-built nginx tree and copies the fresh
-`ngx_http_waf_module.so` into `sandbox/modules/`.
+`ngx_http_heavybag_module.so` into `sandbox/modules/`.
 
 ### Verifying the build
 
@@ -146,7 +146,7 @@ strings sandbox/sbin/nginx | grep -i zlib-ng
    present (a no-op on the first build). You do not need to do this by hand.
 
 2. **A new module source file requires a re-configure.** Adding a `.c` to
-   `modules/ngx_http_waf/config` is not picked up by the `waf_module` fast
+   `modules/ngx_http_heavybag/config` is not picked up by the `heavybag_module` fast
    target alone — the nginx tree must be re-configured. Drop the configure
    stamp so the nginx ExternalProject re-runs `./configure` + `make` on the
    next build (without re-downloading the sources):
@@ -169,7 +169,7 @@ strings sandbox/sbin/nginx | grep -i zlib-ng
 ### Loading the module
 
 ```nginx
-load_module /path/to/sandbox/modules/ngx_http_waf_module.so;
+load_module /path/to/sandbox/modules/ngx_http_heavybag_module.so;
 ```
 
 ### Directive reference
@@ -196,7 +196,7 @@ variable, independent of `waf` / `waf_bot_block`.
 | `waf_verified_bot` | `<class> <path>` | — | Load the published CIDR allowlist for one verifiable class. `<class>` is `crawler` or `ai_crawler` (any other token is a config error); `<path>` is a plain CIDR-per-line file. Per class; **hot-reloadable**. Used only when `waf_fake_bot_block` is `on`. |
 | `waf_ja4_list` | `<path>` | — | Load the JA4-fingerprint → coarse-TLS-family table (`<ja4> <family>` per line; family ∈ `chromium`/`firefox`/`safari`/`tool`/`bot`/`unknown`) consumed by [`$waf_ua_is_spoofed`](#descriptive-ua-variables-waf_ua_). **Optional** — when unset the JA4 half of the spoof signal is inert and `$waf_ua_is_spoofed` degrades to the CIDR-only half. Regenerate offline from a ja4db dump (procedure in the shipped `lists/ja4.list` header). Hot-reloadable. |
 | `waf_server_token` | `<string>` | `Apache/2.4.68 (Unix)` | The fake `Server:` token and the error-page fingerprint. |
-| `waf_reason_header` | `on`\|`off` | `off` | Stamp the per-request WAF verdict token (`$waf_reason`: `none`, `scanner_path`, `args`, `fake_bot`, …) onto the response as `X-WAF-Reason`. **OFF by default — production must not disclose which rule matched** (it aids evasion). Intended for the detect-mode replay/test harness, where it gives per-request verdict attribution on the wire. Independent of `waf` mode (renders `none` when no verdict was resolved). |
+| `waf_reason_header` | `on`\|`off` | `off` | Stamp the per-request heavybag verdict token (`$waf_reason`: `none`, `scanner_path`, `args`, `fake_bot`, …) onto the response as `X-WAF-Reason`. **OFF by default — production must not disclose which rule matched** (it aids evasion). Intended for the detect-mode replay/test harness, where it gives per-request verdict attribution on the wire. Independent of `waf` mode (renders `none` when no verdict was resolved). |
 | `waf_geo_db` | `<path>` | — | Path to the IPFire `location.db` (mmap'd read-only; read by the embedded nanolibloc adaptation, no libloc dependency). |
 | `waf_geo_block` | `<CC> …` | — | Block these country codes (ISO-3166 two-letter, plus IPFire specials A1/A2/A3/T1/XD) → 403. |
 | `waf_asn_block` | `<ASN> …` | — | Block these autonomous systems (decimal, 1..4294967295) when the client IP resolves to one via the geo DB → 403. `asn==0` / no record fails open. Repeatable / multi-arg. |
@@ -303,7 +303,7 @@ proxy_set_header X-Client-Class $waf_type;
 if ($waf_type = ai-crawler) { return 204; }
 ```
 
-Seed lists ship in [`modules/ngx_http_waf/lists/`](modules/ngx_http_waf/lists/),
+Seed lists ship in [`modules/ngx_http_heavybag/lists/`](modules/ngx_http_heavybag/lists/),
 distilled from Matomo `bots.yml`, monperrus/crawler-user-agents,
 ai.robots.txt, and CrawlerDetect. They drift (AI crawlers especially) — a
 config reload recompiles them, so updates are a reload, not a rebuild.
@@ -331,7 +331,7 @@ waf_verified_bot   ai_crawler /etc/nginx/lists/verified-ai.list;
 
 **Verified-bot CIDR file format** — one `addr/prefix` per line; blank lines and
 lines starting with `#` are ignored. Producing the file (JSON → CIDR) is the
-offline cron's job, never the WAF's.
+offline cron's job, never heavybag's.
 
 ```
 # verified-googlebot.list (excerpt)
@@ -499,14 +499,14 @@ it is a config reload — replace `geodb/location.db` atomically and run
 
 The `location.db` is **cryptographically verified at load time**, every config
 parse/reload, before any block offset in it is trusted. libloc embeds an
-**ECDSA P-521 / SHA-512** signature in the database header; the WAF reproduces
+**ECDSA P-521 / SHA-512** signature in the database header; heavybag reproduces
 libloc's `loc_database_verify` with OpenSSL (already linked for JA4 — **no
 libloc dependency**) against the **pinned IPFire signing public key**
 (secp521r1, stable since 2019), which is compiled into the module — there is no
 directive and no opt-out.
 
 The check is **mandatory and fail-closed**: an **unsigned**, **tampered**, or
-**truncated/corrupted** DB — or any OpenSSL error — makes `ngx_http_waf_geo_open`
+**truncated/corrupted** DB — or any OpenSSL error — makes `ngx_http_heavybag_geo_open`
 return `NGX_CONF_ERROR`, so **`nginx -t` fails and nginx refuses to start or
 reload** (the previous config keeps running on a failed reload). The signature
 is dual-slot for key rotation: either slot validating is accepted, and neither
@@ -566,9 +566,9 @@ externally.
 
 ### Stream (L4) protection
 
-The third head, `ngx_stream_waf_module`, guards **raw TCP/UDP** stream
+The third head, `ngx_stream_heavybag_module`, guards **raw TCP/UDP** stream
 connections — not application traffic. It ships in the *same* `.so` as the
-HTTP module (one `load_module`, see [the build descriptor](modules/ngx_http_waf/config));
+HTTP module (one `load_module`, see [the build descriptor](modules/ngx_http_heavybag/config));
 nginx must be built `--with-stream` (it is, in this repo).
 
 At the stream `ACCESS` phase it runs the shared `reputation_check` on the
@@ -595,7 +595,7 @@ same reputation/geo semantics as the HTTP head:
 
 There is no UA / scanner / spoofing in the stream head — L4 has no headers or
 request line; it is pure IP reputation. A denied verdict is logged as
-`waf: stream reputation block (<reason>)`.
+`heavybag: stream reputation block (<reason>)`.
 
 ```nginx
 stream {
@@ -671,7 +671,7 @@ anti-evasion default.
 oldest slot is taken over rather than dropping the sample — a saturating
 attacker evicts *itself* and the limit stays live for every active IP. A lost
 eviction race fails **open** (never a false ban); the `rate_overflow` /
-`waf_rate_overflow_total` counter exposes saturation.
+`heavybag_rate_overflow_total` counter exposes saturation.
 
 **Fail-open contract.** A missing zone, an unsupported address family, or CAS
 starvation all return *allow* — the limiter never produces a false-positive
@@ -679,7 +679,7 @@ ban. Stream rate limiting therefore needs `waf_rate_zone` declared in `http{}`;
 without it the L4 check silently fail-opens.
 
 **Trusted client IP.** The limit keys on the same canonical client address the
-rest of the WAF uses: the socket peer, or the `X-Forwarded-For` client **only**
+rest of heavybag uses: the socket peer, or the `X-Forwarded-For` client **only**
 from a `waf_trusted_proxy` (HTTP), or the mail proxy's `Client-IP` **only** from
 a loopback/unix peer (SMTP-auth). A spoofed `X-Forwarded-For` from an untrusted
 peer cannot earn a fresh bucket.
@@ -727,20 +727,20 @@ The **last path segment** selects the format (default `plain`); only `GET` and
 
 ```console
 $ curl -s http://127.0.0.1/waf/stat/prometheus | head
-waf_up 1
-waf_uptime_seconds 3812
-waf_http_requests_total 19443
-waf_http_blocked_total{reason="blocklist"} 51
-waf_http_blocked_total{reason="scanner_path"} 1208
-waf_http_blocked_total{reason="flag",flag="anycast"} 17
-waf_country_blocked_total{country="CN"} 904
+heavybag_up 1
+heavybag_uptime_seconds 3812
+heavybag_http_requests_total 19443
+heavybag_http_blocked_total{reason="blocklist"} 51
+heavybag_http_blocked_total{reason="scanner_path"} 1208
+heavybag_http_blocked_total{reason="flag",flag="anycast"} 17
+heavybag_country_blocked_total{country="CN"} 904
 ```
 
 What is tracked: global HTTP verdict counters (requests / allowed / allowlist
 hits / blocked-per-reason), the **`would_block`-per-reason** counters bumped by
-`detect` mode (`http_would_block_*` / `waf_http_would_block_total{reason=…}`),
+`detect` mode (`http_would_block_*` / `heavybag_http_would_block_total{reason=…}`),
 the scanner-path 404/403/444 split, response-code
-counters, the `$waf_type` UA distribution, the descriptive **`$waf_ua_category` distribution** (`http_ua_cat_*` / `waf_ua_cat_total{category=…}`) and the **`$waf_ua_is_spoofed` count** (`http_ua_spoofed` / `waf_ua_spoofed_total`), the per-flag breakdown, a bounded
+counters, the `$waf_type` UA distribution, the descriptive **`$waf_ua_category` distribution** (`http_ua_cat_*` / `heavybag_ua_cat_total{category=…}`) and the **`$waf_ua_is_spoofed` count** (`http_ua_spoofed` / `heavybag_ua_spoofed_total`), the per-flag breakdown, a bounded
 open-addressed **per-country** table (total + blocked, with a `cc_overflow`
 guard), a **per-vhost** block breakdown (labelled by `server_name`), the STREAM
 (L4) globals (`stream_connections_total` / `stream_allowed` /
@@ -764,7 +764,7 @@ still needs a full stop+start — `-s reload` does not reload module code.
 ### Example configuration
 
 A complete, runnable example lives in [`sandbox/nginx.conf`](sandbox/nginx.conf).
-It wires up all three heads: the WAF on a public HTTP/2 + HTTP/3 server
+It wires up all three heads: heavybag on a public HTTP/2 + HTTP/3 server
 (ports 8080/8443) with the four UA lists loaded, an `X-WAF-Type $waf_type`
 test header, and a `location = /geo-whitelist` demoing whitelist mode; a
 localhost-only `auth_http` endpoint (8081); two SMTP heads — an inbound MX
@@ -777,7 +777,7 @@ SMTP AUTH); and a `stream {}` block with two L4 servers (`:9090` blocklisted
 Minimal HTTP example:
 
 ```nginx
-load_module .../sandbox/modules/ngx_http_waf_module.so;
+load_module .../sandbox/modules/ngx_http_heavybag_module.so;
 
 http {
     waf               on;
@@ -873,14 +873,14 @@ the connection peer and closes the connection on any deny — see
 ## Threat model & rule tuning
 
 The rule set is fitted to this edge's real attack surface, not guessed. A
-~4-year pre-WAF capture (1.65M requests) shows a pure internet-scan profile:
+~4-year pre-heavybag capture (1.65M requests) shows a pure internet-scan profile:
 PHP/CMS probing dominates (`php` 364k, `wordpress` 139k), credential/secret
 harvesting is a fast-growing second (`secret_vcs` 161k, led by `/.env` and
 `/.git/config`), followed by router/IoT RCE and appliance-CVE probes — with
 scan volume roughly **doubling year over year**. ~36% of all traffic already
 404'd at the legacy backend, and ~8% was non-HTTP protocol junk (TLS/RDP/SMB/SSH
 banners, malware beacons) rejected at nginx's request-line parser as 400 —
-*before* any WAF phase runs, so the WAF deliberately does not try to classify it.
+*before* any heavybag phase runs, so heavybag deliberately does not try to classify it.
 
 `scanners.list` is maintained by a repeatable, read-only gap-analysis loop
 against this corpus (libc tools only — no libloc). See
@@ -891,7 +891,7 @@ regression fixtures · geo/ASN tuning).
 
 **Corpus tooling.** The capture lives in `ngxlogs/access.log` (read-only, not
 tracked); all derived artifacts are IP-free and gitignored under
-`modules/ngx_http_waf/tests/corpus/`. The committable, core-perl tools are:
+`modules/ngx_http_heavybag/tests/corpus/`. The committable, core-perl tools are:
 
 - **`tools/extract-replay-vectors.pl`** — single read-only pass over the
   capture → the deduplicated, §3-class-labelled `replay-vectors.jsonl` attack
@@ -902,7 +902,7 @@ tracked); all derived artifacts are IP-free and gitignored under
   replay fixtures (UA / Referer / Cookie / fake-bot) by merging the corpus
   feeds with the external threat-intel below and synthetic SQLi, sanitizing the
   uncurated lists (drop control bytes / comments, decode HTML entities).
-- **`tests/waf-replay-test.conf`** — the dimension-clean detect-mode vhosts the
+- **`tests/heavybag-replay-test.conf`** — the dimension-clean detect-mode vhosts the
   corpus is replayed against (exactly one matcher enabled per vhost, no
   `proxy_pass`, loopback-only, no `waf_trusted_proxy`).
 - **`tests/replay-client.pl`** + **`tests/run-replay-tests.sh`** — the replay
@@ -942,13 +942,13 @@ the embedded reader came from and how it is validated:
 - **`reference/nanolibloc.c`** — the minimal, dependency-free libloc
   (`location.db`) reader by **arpi_esp**, from
   [`gereoffy/ipstat46`](https://github.com/gereoffy/ipstat46/blob/main/nanolibloc.c).
-  The module's `waf_geo.c` is an in-tree adaptation of it (mmap'd, read-only,
+  The module's `heavybag_geo.c` is an in-tree adaptation of it (mmap'd, read-only,
   libc-only). Credit and thanks to arpi_esp for the original nanolibloc.
 - **`reference/loctest.c`** — a standalone geo oracle: it resolves IPs against
   `location.db` independently of nginx, used to cross-check the module's
   country / network-flag lookups during development.
 
-The seed UA signature lists in `modules/ngx_http_waf/lists/` were distilled
+The seed UA signature lists in `modules/ngx_http_heavybag/lists/` were distilled
 from these public catalogues (all permissively licensed); refresh against them
 periodically — AI-crawler UAs in particular drift fast:
 

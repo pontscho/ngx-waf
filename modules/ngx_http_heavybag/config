@@ -1,0 +1,53 @@
+# ngx_http_heavybag_module - build descriptor
+#
+# One dynamic .so registering TWO modules: ngx_http_heavybag_module (HTTP) and
+# ngx_stream_heavybag_module (STREAM, the L4 reputation head). auto/module names
+# the .so after the first entry in ngx_module_name and compiles every listed
+# module into it; each module declares its own type at runtime.
+#
+# No external libraries: PCRE2 comes from nginx's own ngx_regex (already
+# linked), and the geo reader is the embedded nanolibloc adaptation (libc
+# only). ngx_module_libs stays empty. Requires nginx built --with-stream.
+
+ngx_addon_name=ngx_http_heavybag_module
+
+heavybag_deps="$ngx_addon_dir/src/ngx_http_heavybag.h \
+         $ngx_addon_dir/src/heavybag_match.h \
+         $ngx_addon_dir/src/heavybag_spoof.h \
+         $ngx_addon_dir/src/heavybag_geo.h \
+         $ngx_addon_dir/src/heavybag_rep.h \
+         $ngx_addon_dir/src/heavybag_rate.h \
+         $ngx_addon_dir/src/heavybag_reputation.h \
+         $ngx_addon_dir/src/heavybag_authhttp.h \
+         $ngx_addon_dir/src/heavybag_status.h \
+         $ngx_addon_dir/src/heavybag_ja4.h \
+         $ngx_addon_dir/src/ngx_http_heavybag_ua_enums.h \
+         $ngx_addon_dir/src/heavybag_ua_parse.h"
+
+heavybag_srcs="$ngx_addon_dir/src/ngx_http_heavybag_module.c \
+         $ngx_addon_dir/src/heavybag_match.c \
+         $ngx_addon_dir/src/heavybag_spoof.c \
+         $ngx_addon_dir/src/heavybag_geo.c \
+         $ngx_addon_dir/src/heavybag_reputation.c \
+         $ngx_addon_dir/src/heavybag_rate.c \
+         $ngx_addon_dir/src/heavybag_authhttp.c \
+         $ngx_addon_dir/src/heavybag_stream.c \
+         $ngx_addon_dir/src/heavybag_status.c \
+         $ngx_addon_dir/src/heavybag_ja4.c \
+         $ngx_addon_dir/src/heavybag_ua_parse.c"
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name="ngx_http_heavybag_module ngx_stream_heavybag_module"
+    ngx_module_incs="$ngx_addon_dir/src"
+    ngx_module_deps="$heavybag_deps"
+    ngx_module_srcs="$heavybag_srcs"
+    ngx_module_libs=
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES ngx_http_heavybag_module"
+    STREAM_MODULES="$STREAM_MODULES ngx_stream_heavybag_module"
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $heavybag_deps"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $heavybag_srcs"
+    CORE_INCS="$CORE_INCS $ngx_addon_dir/src"
+fi

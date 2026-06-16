@@ -15,7 +15,7 @@ source catalogue for the honeypot program's **header dimension**
 
 ---
 
-## 0. How this maps to the WAF
+## 0. How this maps to the heavybag module
 
 The module already matches on:
 `User-Agent` (`scanner-ua.list` / `bot.list`), `Referer` signatures, `Cookie`

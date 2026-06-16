@@ -1,0 +1,219 @@
+# ngx_http_heavybag_module - scanner path blocklist
+#
+# Format: one PCRE2 pattern per line, optional trailing action token.
+#   <pattern>[ <action>]      action in { 404 (default), 403, 444 }
+#
+# Patterns are matched case-insensitively against the normalized request
+# URI (r->uri). ANCHOR every pattern with ^ so a path component cannot be
+# matched mid-URI (the legacy nginx-firewall.conf had unanchored `~* html`
+# style rules that blocked legitimate paths like /index.html). Patterns
+# sharing an action are compiled into one alternation regex.
+#
+# Secret/dotfile rules use (^|/) so they also catch nested probes such as
+# /app/.env or /x/.git/config (scanners walk many path prefixes).
+#
+# This file is hot-reloadable: `nginx -s reload` re-reads and recompiles it.
+
+# ---- WordPress -------------------------------------------------------------
+^/wp-
+^/xmlrpc\.php$
+^/wordpress
+(^|/)wlwmanifest\.xml$
+
+# ---- VCS / secrets / dotfiles ---------------------------------------------
+(^|/)\.git
+(^|/)\.svn
+(^|/)\.hg
+(^|/)\.env
+(^|/)\.aws/
+(^|/)\.ssh/
+^/\.DS_Store$
+^/\.vscode/
+^/\.well-known/(?!acme-challenge/)
+^/config\.json$
+^/web\.config$
+
+# ---- backups / dumps -------------------------------------------------------
+^/backup\.(zip|sql|tar\.gz|tgz|rar)$
+^/dump\.sql$
+^/db\.sql$
+^/database\.sql$
+^/.*\.bak$
+
+# ---- PHP / framework probes -----------------------------------------------
+^/phpinfo\.php$
+^/info\.php$
+^/phpmyadmin/ 403
+^/pma/ 403
+^/vendor/phpunit/
+phpunit/.{0,40}eval-stdin\.php
+^/_ignition/execute-solution$
+^/telescope/requests$
+^/_profiler
+(^|/)debug/default/view
+# Generic .php catch-all. This edge serves no PHP app (every .php 404'd in the
+# corpus; the legit baseline has zero .php), so a blanket extension rule has no
+# false-positive surface here -- validated by the work-stream B detect FP gate.
+# Raises php-class path coverage 41.6%->~95% (+~127k random-named webshell /
+# probe paths). Matches path-info (/app_dev.php/_profiler/...), .phpN webshells
+# (.php5/.php7), and IIS source-leak suffixes (.php::$DATA, .php~, .php.old).
+^/.*\.php[0-9]?($|[/.~:])
+^/phpinfo
+
+# ---- mail / exchange / OWA -------------------------------------------------
+^/owa
+^/ecp
+^/autodiscover
+^/Autodiscover
+^/exchange/
+
+# ---- appliances / RCE-prone endpoints -------------------------------------
+^/remote/fgt_lang
+^/remote/login
+^/\+cscoe\+/
+^/bin/sh$
+^/api/v2/cmdb/system/admin/admin
+^/HNAP1
+^/SDK/webLanguage
+^/boaform/
+^/cgi-bin/
+^/actuator
+^/geoserver
+^/solr/
+^/manager/(html|text)
+^/login\.action$
+^/struts
+^/v2/_catalog$
+^/_all_dbs$
+^/dns-query
+^/resolve\?
+^/scripts/WPnBr\.dll$
+(^|/)Telerik\.Web\.UI\.WebResource\.axd
+(^|/)GponForm/
+^/\+CSCOL\+/
+(^|/)developmentserver/metadatauploader
+^/config/getuser
+^/dana-na/
+^/dana-cached/
+^/mgmt/tm/util/bash
+^/api/sonicos/
+(^|/)mifs/
+^/CFIDE/
+^/sitecore/
+^/RDWeb/
+^/evox/about
+^/parastable/
+(^|/)etc/passwd
+
+# ---- credential / config / infra-API leaks --------------------------------
+# Config/IaC/secret files are never served at this edge (baseline serves only
+# /, /app.*, static assets), so blanket extension rules for config-only formats
+# (.yml/.yaml/.properties/.tfstate/.tfvars) have no false-positive surface here
+# -- validated by the work-stream B detect FP gate. Distinctive .json/dotfile
+# secret stores are enumerated instead (a blanket .json rule would hit the
+# /app.json baseline). 2026-06 gap-loop, extended.
+(^|/)aws/credentials
+^/credentials$
+^/.*\.env$
+^/.*\.ya?ml$
+^/.*\.properties$
+^/.*\.tfstate
+^/.*\.tfvars$
+(^|/)appsettings(\.[A-Za-z]+)?\.json$
+(^|/)credentials\.json$
+(^|/)client_secrets\.json$
+(^|/)secrets\.json$
+(^|/)auth\.json$
+(^|/)composer\.(json|lock)$
+(^|/)sftp-config\.json$
+(^|/)settings\.json$
+(^|/)local\.settings\.json$
+(^|/)\.runtimeconfig\.json$
+(^|/)env\.(json|txt)$
+(^|/)connectionstrings\.config$
+^/Web\.(Debug|Release)\.config$
+^/web\.config[~.]
+(^|/)settings\.py$
+(^|/)global\.asax$
+(^|/)\.npmrc$
+(^|/)\.netrc$
+(^|/)\.htpasswd$
+(^|/)\.dockerenv$
+(^|/)\.kube/
+(^|/)\.composer/
+(^|/)\.docker/config\.json$
+(^|/)config/credentials
+(^|/)config/master\.key$
+(^|/)storage/logs/
+^/error\.log$
+^/env$
+(^|/)containers/json
+^/server-status
+^/server-info$
+^/nginx_status$
+^/druid/
+
+# ---- generic admin / installer probes -------------------------------------
+^/administrator
+^/ReportServer
+^/Temporary_Listen_Addresses
+
+# ---- known nmap / scanner fingerprints ------------------------------------
+^/nmaplowercheck
+^/HNAP1$
+^/sdk$
+(^|/)Trinity\.txt
+^/hello\.world$
+
+# ---- noisy junk paths from the legacy list (random scanner tokens) --------
+^/1rRg$
+^/99vt$
+^/aaa9$
+^/aab8$
+^/aab9$
+^/4Wnc$
+^/Flr9$
+^/6ckX$
+^/0xZZ$
+^/jITU$
+^/oEq7$
+^/MNLu$
+^/nJo5$
+^/WLIp$
+^/pEWP$
+^/__Additional
+
+# ---- misc scanner targets --------------------------------------------------
+^/3rdpartylicenses\.txt$
+^/localizations/zh\.json$
+^/CSS/Miniweb\.css$
+^/Portal/Portal\.mwsl$
+^/Portal0000\.htm$
+^/viwwwsogou$
+^/c/msdownload
+^/readme\.txt$
+^/users/sign_in$
+^/confluence/rest/applinks/
+
+# ---- extensions that should never be served at this edge ------------------
+^/.*\.(cgi|asp|aspx|jsp|jsa|cfm|pl)$
+
+# ---- static-extension-cloaked probes (COMMENTED; threat-model §6 step-0) ----
+# Hostile paths that END IN a .js/.css static extension, so the replay-corpus
+# static-ext baseline absorbs them (docs/threat-model.md §6 step 0 surfaced these
+# in the sanity gate). LEFT COMMENTED on purpose: a suffix rule on a static
+# extension can false-positive on a real SPA asset of the same name -- enable
+# each (drop the leading '#') only after a detect-mode FP check (work-stream B).
+# Trailing volumes are from the 2026-06 corpus; comments stay on their own line
+# so an enabled pattern is a clean PCRE2 line.
+#
+# ColdFusion CKEditor / admin probe (~160)
+#^/cf_scripts/
+# PM2 ecosystem config leak (~148)
+#^/ecosystem\.config\.js$
+# client/env config leak (~147)
+#^/env\.js$
+# server source leak (~134)
+#^/server\.js$
+# DB / server config leak (~200)
+#^/config/(?:database|server)\.js$

@@ -3,11 +3,11 @@
 #
 #   cmake -B build -S .          # configure: declare the 3 ExternalProjects
 #   cmake --build build -j       # fetch + build zlib-ng, fetch OpenSSL src,
-#                                #   build nginx + WAF module, install -> sandbox/
+#                                #   build nginx + heavybag dynamic module, install -> sandbox/
 #
 # Produces (installed into the runnable sandbox/ tree):
-#   sandbox/sbin/nginx                       (OpenSSL 3.5.7 + static zlib-ng)
-#   sandbox/modules/ngx_http_waf_module.so   (the WAF dynamic module)
+#   sandbox/sbin/nginx                           (OpenSSL 3.5.7 + static zlib-ng)
+#   sandbox/modules/ngx_http_heavybag_module.so  (the heavybag dynamic module)
 #
 # Dependency chain:
 #   zlibng_ext  --(static libz.a + zlib.h)----\
@@ -127,27 +127,27 @@ ExternalProject_Add(nginx_ext
       --with-openssl=${OPENSSL_SRC_DIR}
       --with-cc-opt=-I${ZLIBNG_PREFIX}/include
       --with-ld-opt=-L${ZLIBNG_PREFIX}/lib
-      --add-dynamic-module=${CMAKE_SOURCE_DIR}/modules/ngx_http_waf
+      --add-dynamic-module=${CMAKE_SOURCE_DIR}/modules/ngx_http_heavybag
   BUILD_COMMAND    sh ${_NGINX_BUILD_SCRIPT}
   INSTALL_COMMAND  make install
   BUILD_BYPRODUCTS ${SANDBOX_DIR}/sbin/nginx
-                   ${SANDBOX_DIR}/modules/ngx_http_waf_module.so)
+                   ${SANDBOX_DIR}/modules/ngx_http_heavybag_module.so)
 ExternalProject_Get_Property(nginx_ext SOURCE_DIR)
 set(NGINX_SRC_DIR ${SOURCE_DIR})
 
 # ============================================================================
-# Convenience target — fast WAF-module iteration
-#   cmake --build build --target waf_module
+# Convenience target — fast heavybag-module iteration
+#   cmake --build build --target heavybag_module
 # Re-runs only `make modules` in the already-built nginx tree and copies the
 # fresh .so into sandbox/. NOTE: a rebuilt .so needs a full nginx stop+start —
 # `nginx -s reload` does NOT reload module code.
 # ============================================================================
-add_custom_target(waf_module
+add_custom_target(heavybag_module
   # Same generated-script guard as nginx_ext -- an inline `sh -c` with shell
   # operators gets mangled by CMake's recipe-line escaping (see note above).
   COMMAND sh ${_SSL_TOUCH_GUARD}
   COMMAND make -C ${NGINX_SRC_DIR} modules
   COMMAND ${CMAKE_COMMAND} -E copy
-          ${NGINX_SRC_DIR}/objs/ngx_http_waf_module.so
-          ${SANDBOX_DIR}/modules/ngx_http_waf_module.so
-  COMMENT "Rebuilding ngx_http_waf_module.so and copying into sandbox/modules/")
+          ${NGINX_SRC_DIR}/objs/ngx_http_heavybag_module.so
+          ${SANDBOX_DIR}/modules/ngx_http_heavybag_module.so
+  COMMENT "Rebuilding ngx_http_heavybag_module.so and copying into sandbox/modules/")
