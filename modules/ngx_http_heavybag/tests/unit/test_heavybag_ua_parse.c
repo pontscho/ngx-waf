@@ -406,6 +406,281 @@ CTEST(spoof, unmapped_ua_is_not_spoof)
 }
 
 
+/* ===================================================================== *
+ *  EDGE / FUZZ vectors (WF-3 ua-fuzz backlog, Test-matrix Phase 3)      *
+ *                                                                       *
+ *  These drive the two security-critical primitives DIRECTLY -- the     *
+ *  bounded case-insensitive scan heavybag_ua_find() and the charset-     *
+ *  clamped version slice heavybag_ua_version() (both `static`, reachable *
+ *  because the .c is #included into this TU) -- plus the parse-core      *
+ *  orchestrator at its boundary conditions. They are the byte-level      *
+ *  robustness net the happy-path suites above do not cover.             *
+ *                                                                       *
+ *  OUT OF UNIT SCOPE (runtime-bound, NOT faked here): the nginx-facing   *
+ *  wrappers ngx_http_heavybag_ua_parse() (request-ctx population,        *
+ *  ua_parsed latch, threat-category override) and                       *
+ *  ngx_http_heavybag_ua_spoof_eval() (live JA4 fetch from SSL ex-data +  *
+ *  verified-bot CIDR signal) sit behind #ifndef HEAVYBAG_UA_PARSE_UNIT_  *
+ *  TEST -- they need an ngx_http_request_t and a TLS connection. The     *
+ *  ja4_signal contradiction boolean is already mirrored in the `spoof`   *
+ *  suite; the live JA4 wire walk is Phase 6b. The CR/LF/quote clamp's    *
+ *  downstream-sink protection (log_format / add_header) is an            *
+ *  integration concern; the core only guarantees the slice TERMINATES    *
+ *  at the first out-of-charset byte -- that termination is what we test. *
+ * ===================================================================== */
+
+/* parse-core helper taking an EXPLICIT length: P() above uses strlen(), so it
+ * cannot carry an embedded NUL or a non-NUL-terminated oversized buffer. */
+static pr_t
+PN(const u_char *ua, size_t n)
+{
+    pr_t  r;
+    heavybag_ua_parse_core(ua, n, &r.b, &r.o, &r.c, &r.v, &r.vs, &r.vl);
+    return r;
+}
+
+
+/* ===================================================================== *
+ *  heavybag_ua_find -- the bounded, case-insensitive scan primitive      *
+ * ===================================================================== */
+
+/* The scan must NEVER compute hlen-nlen when nlen>hlen: in size_t that
+ * underflows to an astronomical `last` -> wild over-read. The nlen>hlen guard
+ * returns NULL first. (Backlog: single-byte < every needle, underflow guard.) */
+CTEST(ua_find, needle_longer_than_hay_no_underflow)
+{
+    ASSERT_NULL(heavybag_ua_find((const u_char *) "ab", 2, "abc", 3));
+    ASSERT_NULL(heavybag_ua_find((const u_char *) "", 0, "x", 1));
+}
+
+/* nlen==hlen: last==0, the outer loop runs exactly once at i==0. */
+CTEST(ua_find, exact_length_match_last_zero)
+{
+    const u_char  *hay = (const u_char *) "abc";
+    ASSERT_TRUE(heavybag_ua_find(hay, 3, "abc", 3) == hay);
+    ASSERT_NULL(heavybag_ua_find(hay, 3, "abd", 3));
+}
+
+/* nlen==0 short-circuits to NULL (the getter then reports not-found). */
+CTEST(ua_find, empty_needle_is_null)
+{
+    ASSERT_NULL(heavybag_ua_find((const u_char *) "abc", 3, "", 0));
+}
+
+/* Match at the final valid offset i==last (the inclusive upper bound). */
+CTEST(ua_find, match_at_final_position)
+{
+    const u_char  *hay = (const u_char *) "xxabc";
+    ASSERT_TRUE(heavybag_ua_find(hay, 5, "abc", 3) == hay + 2);
+}
+
+/* The scan is LENGTH-driven, not NUL-terminated: a needle after an embedded
+ * NUL is still found (strstr / strcasestr would stop at the NUL). */
+CTEST(ua_find, nul_transparent_scan)
+{
+    static const u_char  hay[] = "a\0Chrome";   /* 8 bytes incl. the NUL */
+    ASSERT_TRUE(heavybag_ua_find(hay, sizeof(hay) - 1, "Chrome", 6) == hay + 2);
+}
+
+/* ASCII case-fold applies to A-Z only (the |0x20 path on both operands). */
+CTEST(ua_find, case_insensitive_fold)
+{
+    const u_char  *hay = (const u_char *) "fooCHROMEbar";
+    ASSERT_TRUE(heavybag_ua_find(hay, 12, "chrome", 6) == hay + 3);
+}
+
+
+/* ===================================================================== *
+ *  heavybag_ua_version -- the charset-clamped version slice (security)   *
+ * ===================================================================== */
+
+/* Token at the very end of the buffer: s==end, the charset loop never runs,
+ * vlen 0, vstart points AT end (one past) -- but no byte beyond end is read. */
+CTEST(ua_version, token_at_buffer_end_zero_len)
+{
+    const u_char  *hay = (const u_char *) "Chrome/";
+    const u_char  *vs;
+    size_t         vl;
+    heavybag_ua_version(hay, 7, "Chrome/", 7, &vs, &vl);
+    ASSERT_EQUAL((size_t) 0, vl);
+    ASSERT_TRUE(vs == hay + 7);
+}
+
+/* A NUL byte is outside [0-9A-Za-z._-] -> it terminates the slice. */
+CTEST(ua_version, nul_byte_terminates_version)
+{
+    static const u_char  hay[] = "curl/8.5\0.0";   /* 11 bytes incl. the NUL */
+    const u_char        *vs;
+    size_t               vl;
+    heavybag_ua_version(hay, sizeof(hay) - 1, "curl/", 5, &vs, &vl);
+    ASSERT_DATA((const unsigned char *) "8.5", 3, vs, vl);
+}
+
+/* A high-bit byte (>=0x80, e.g. a UTF-8 lead byte) is outside the ASCII
+ * charset -> overlong / multibyte version sequences clamp at the first such
+ * byte (no raw 8-bit bytes reach a downstream sink). */
+CTEST(ua_version, high_bit_byte_terminates_version)
+{
+    const u_char  *hay = (const u_char *) "curl/8.5.0\xC3\xA9";
+    const u_char  *vs;
+    size_t         vl;
+    heavybag_ua_version(hay, 12, "curl/", 5, &vs, &vl);
+    ASSERT_DATA((const unsigned char *) "8.5.0", 5, vs, vl);
+}
+
+/* The full conservative charset (digits . _ - lower upper) is accepted. */
+CTEST(ua_version, full_charset_accepted)
+{
+    const u_char  *hay = (const u_char *) "X/1.2.3-rc_4Z ";
+    const u_char  *vs;
+    size_t         vl;
+    heavybag_ua_version(hay, 14, "X/", 2, &vs, &vl);
+    ASSERT_DATA((const unsigned char *) "1.2.3-rc_4Z", 11, vs, vl);
+}
+
+/* Token absent -> vstart NULL + vlen 0 (out-params reset, poison overwritten). */
+CTEST(ua_version, absent_token_null_slice)
+{
+    const u_char  *hay = (const u_char *) "Mozilla/5.0";
+    const u_char  *vs = hay;   /* poison */
+    size_t         vl = 99;    /* poison */
+    heavybag_ua_version(hay, 11, "Chrome/", 7, &vs, &vl);
+    ASSERT_NULL(vs);
+    ASSERT_EQUAL((size_t) 0, vl);
+}
+
+/* The version is a zero-copy SLICE with NO upper length clamp -- a 4 KB
+ * all-digit version is returned whole. Intentional; the note for downstream
+ * sinks is that the slice length is attacker-influenced and must be bounded by
+ * the consumer (the core neither copies nor truncates). */
+CTEST(ua_version, enormous_all_digit_version)
+{
+    static u_char  big[7 + 4096];
+    const u_char  *vs;
+    size_t         vl;
+    memcpy(big, "Chrome/", 7);
+    memset(big + 7, '9', 4096);
+    heavybag_ua_version(big, sizeof(big), "Chrome/", 7, &vs, &vl);
+    ASSERT_EQUAL((size_t) 4096, vl);
+    ASSERT_TRUE(vs == big + 7);
+}
+
+/* A space (the common token delimiter) terminates the slice. */
+CTEST(ua_version, space_terminates_version)
+{
+    const u_char  *hay = (const u_char *) "Chrome/120 Safari";
+    const u_char  *vs;
+    size_t         vl;
+    heavybag_ua_version(hay, 17, "Chrome/", 7, &vs, &vl);
+    ASSERT_DATA((const unsigned char *) "120", 3, vs, vl);
+}
+
+
+/* ===================================================================== *
+ *  parse-core orchestrator -- boundary / ordering edges                 *
+ * ===================================================================== */
+
+/* Empty UA: ALL FOUR descriptive fields stay UNKNOWN and the version is empty
+ * -- every needle hits the nlen>hlen guard (hlen==0). (Complements
+ * ua_browser/empty_is_unknown, which checks only the browser + vlen.) */
+CTEST(ua_edge, empty_ua_all_fields_unknown)
+{
+    pr_t  r = P("");
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_UNKNOWN, r.b);
+    ASSERT_EQUAL(HEAVYBAG_OS_UNKNOWN, r.o);
+    ASSERT_EQUAL(HEAVYBAG_CAT_UNKNOWN, r.c);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_UNKNOWN, r.v);
+    ASSERT_EQUAL((size_t) 0, r.vl);
+}
+
+/* A single byte is shorter than every needle (the shortest is "wv", 2 bytes)
+ * -> the underflow guard fires for all of them; nothing resolves, no over-read. */
+CTEST(ua_edge, single_byte_ua_all_unknown)
+{
+    pr_t  r = P("M");
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_UNKNOWN, r.b);
+    ASSERT_EQUAL(HEAVYBAG_OS_UNKNOWN, r.o);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_UNKNOWN, r.v);
+}
+
+/* A multi-kilobyte UA with no recognized token runs every needle scan to
+ * completion (i up to last across 8 KB) without over-reading; result UNKNOWN. */
+CTEST(ua_edge, multi_kb_no_delimiter)
+{
+    static u_char  big[8192];
+    pr_t           r;
+    memset(big, 'a', sizeof(big));
+    r = PN(big, sizeof(big));
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_UNKNOWN, r.b);
+    ASSERT_EQUAL(HEAVYBAG_OS_UNKNOWN, r.o);
+}
+
+/* The Chrome webview form ("...; wv) ... Chrome/...") is detected as chrome via
+ * the dedicated wv branch, which deliberately yields NO version slice (vl 0)
+ * -- distinct from a normal Chrome UA that slices the Chrome/ version. */
+CTEST(ua_edge, webview_wv_no_version)
+{
+    pr_t  r = P("Mozilla/5.0 (Linux; Android 13; wv) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile "
+                "Safari/537.36");
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_CHROME, r.b);
+    ASSERT_EQUAL((size_t) 0, r.vl);
+    ASSERT_EQUAL(HEAVYBAG_OS_ANDROID, r.o);
+    ASSERT_EQUAL(HEAVYBAG_CAT_MOBILE, r.c);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_GOOGLE, r.v);
+}
+
+/* AppleWebKit present but NO Safari/ token -> SAFARI with an EMPTY version
+ * (HEAVYBAG_VER on the absent "Safari/" yields len 0); vendor still apple. */
+CTEST(ua_edge, applewebkit_without_safari_empty_version)
+{
+    pr_t  r = P("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko)");
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_SAFARI, r.b);
+    ASSERT_EQUAL((size_t) 0, r.vl);
+    ASSERT_EQUAL(HEAVYBAG_OS_MACOS, r.o);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_APPLE, r.v);
+}
+
+/* CriOS/ (Chrome on iOS) is matched BEFORE the trailing Safari/ token, so an
+ * iOS Chrome resolves to chrome/google, not safari/apple (ordering precedence). */
+CTEST(ua_edge, crios_over_safari)
+{
+    pr_t  r = P("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/120.0.6099.119 "
+                "Mobile/15E148 Safari/604.1");
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_CHROME, r.b);
+    ASSERT_TRUE(veq(r, "120.0.6099.119"));
+    ASSERT_EQUAL(HEAVYBAG_OS_IPHONE, r.o);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_GOOGLE, r.v);
+}
+
+/* HarmonyOS + bare Chrome: the OS resolves to harmonyos, but the VENDOR is
+ * driven by the browser switch (chrome -> google), which precedes the
+ * os==harmonyos -> huawei fallback. Browser-vendor wins over os-vendor. */
+CTEST(ua_edge, harmonyos_browser_vendor_precedence)
+{
+    pr_t  r = P("Mozilla/5.0 (Linux; Android 10; HarmonyOS) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 "
+                "Mobile Safari/537.36");
+    ASSERT_EQUAL(HEAVYBAG_OS_HARMONYOS, r.o);
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_CHROME, r.b);
+    ASSERT_EQUAL(HEAVYBAG_VENDOR_GOOGLE, r.v);
+    ASSERT_TRUE(veq(r, "114.0.0.0"));
+}
+
+/* End-to-end NUL transparency through the orchestrator: a recognized token
+ * placed AFTER an embedded NUL (explicit length, NOT strlen) is still found,
+ * so a UA cannot smuggle bytes past the parser with a NUL truncation. */
+CTEST(ua_edge, embedded_nul_then_token_found)
+{
+    static const u_char  ua[] = "ab\0Chrome/120.0.0.0";  /* 19 bytes incl NUL */
+    pr_t                  r = PN(ua, sizeof(ua) - 1);
+    ASSERT_EQUAL(HEAVYBAG_BROWSER_CHROME, r.b);
+    ASSERT_TRUE(veq(r, "120.0.0.0"));
+}
+
+
 int
 main(int argc, const char *argv[])
 {

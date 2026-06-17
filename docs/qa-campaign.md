@@ -447,3 +447,39 @@ New `tests/unit/test-geo.c` (suite `geo`) includes `heavybag_geo.c` directly und
 **Verification:** `run-unit-tests.sh` exit 0 — **geo 20/20**, rate 16/16, JA4 7/7, UA 36/36 (regressions clean). The header touches 4 production TUs → verified byte-transparent: SSL `objs/` rebuild clean `-Werror` (zero warnings, all 4 includer TUs compile silently), md5 build==deploy `c1ddfa3b4772403e8331f843034be16d`, `nginx -t` binary-compatible; the `objs-nossl` and `objs-nostream` permutation trees also compile `heavybag_geo.c` clean. The `.so` md5 changed from Phase 1's `dd921b76…` to `c1ddfa3b…` due only to `__LINE__`/debug-info shift from the added `#ifndef` lines — the production preprocessed token stream is unchanged (the guards take the nginx branch in the no-`-D` build). No production logic changed.
 
 **Not committed:** partner commits source+tests on main + pushes himself.
+
+### Phase 3 — `ua_parse` extend (21 vectors) — COMPLETED 2026-06-17
+
+The descriptive UA parser core (`heavybag_ua_parse.c`, 769 lines) already had a 36-case happy-path + ordering + clamp suite. This phase adds the **WF-3 ua-fuzz backlog (21 vectors)** as a byte-level robustness net, driving the two security-critical primitives DIRECTLY — `heavybag_ua_find()` (the bounded, case-insensitive scan; never reads past `hay+hlen`) and `heavybag_ua_version()` (the `[0-9A-Za-z._-]` version slice; the CR/LF/quote/control-char clamp is the parser's one attacker-byte sink). Both are `static` and reachable because the test `#include`s the `.c` under `-DHEAVYBAG_UA_PARSE_UNIT_TEST`. **No production source touched, no header split needed** (the existing isolation harness already pulls in the nginx-free core); the deployed SSL `.so` is byte-identical (md5 unchanged).
+
+Three suites added to `tests/unit/test_heavybag_ua_parse.c`:
+
+| # | Suite / test | Vector | Assertion |
+|---|---|---|---|
+| V1 | `ua_find/needle_longer_than_hay_no_underflow` | `nlen>hlen` (and `hlen==0`) | NULL — the size_t underflow guard (`last=hlen-nlen` never computed) |
+| V2 | `ua_find/exact_length_match_last_zero` | `nlen==hlen` | match returns `hay` at `last==0`; mismatch → NULL |
+| V3 | `ua_find/empty_needle_is_null` | `nlen==0` | NULL short-circuit |
+| V4 | `ua_find/match_at_final_position` | match at `i==last` | returns `hay+2` (inclusive upper bound) |
+| V5 | `ua_find/nul_transparent_scan` | embedded NUL mid-hay | needle after the NUL still found (length-driven, not strstr) |
+| V6 | `ua_find/case_insensitive_fold` | `CHROME` vs `chrome` | `|0x20` A–Z fold matches at `hay+3` |
+| V7 | `ua_version/token_at_buffer_end_zero_len` | token at EOF (`s==end`) | vlen 0, vstart==`hay+hlen`, no byte beyond end read |
+| V8 | `ua_version/nul_byte_terminates_version` | NUL in version charset | slice clamps before the NUL (`"8.5"`) |
+| V9 | `ua_version/high_bit_byte_terminates_version` | `>=0x80` (UTF-8 lead) | clamps at the first 8-bit byte (`"8.5.0"`) — overlong-UTF-8 passthrough blocked |
+| V10 | `ua_version/full_charset_accepted` | digits `.` `_` `-` lower upper | whole `"1.2.3-rc_4Z"` sliced verbatim |
+| V11 | `ua_version/absent_token_null_slice` | token not present | vstart NULL + vlen 0 (poison overwritten) |
+| V12 | `ua_version/enormous_all_digit_version` | 4 KB all-digit version | vlen 4096 — zero-copy slice, NO length clamp (downstream-overflow note: consumer must bound its own copy) |
+| V13 | `ua_version/space_terminates_version` | common delimiter | slice clamps at the space (`"120"`) |
+| V14 | `ua_edge/empty_ua_all_fields_unknown` | empty UA | browser/os/category/vendor ALL UNKNOWN + vlen 0 (every needle hits the `nlen>hlen` guard) |
+| V15 | `ua_edge/single_byte_ua_all_unknown` | 1-byte UA `"M"` | all UNKNOWN (shorter than every needle, shortest is `wv`=2) |
+| V16 | `ua_edge/multi_kb_no_delimiter` | 8 KB of `'a'`, no token | UNKNOWN; every needle scan runs to `i==last` across 8 KB, no over-read |
+| V17 | `ua_edge/webview_wv_no_version` | `; wv) ... Chrome/` | CHROME via the dedicated `wv` branch, which yields **vlen 0** (no version slice) |
+| V18 | `ua_edge/applewebkit_without_safari_empty_version` | AppleWebKit, no `Safari/` | SAFARI with empty version (HEAVYBAG_VER on absent token → len 0), vendor apple |
+| V19 | `ua_edge/crios_over_safari` | iOS Chrome (`CriOS/`) | CHROME/google before the trailing `Safari/` (ordering precedence), version `120.0.6099.119` |
+| V20 | `ua_edge/harmonyos_browser_vendor_precedence` | HarmonyOS + bare Chrome | os HARMONYOS but vendor GOOGLE — browser-switch precedes the os→huawei fallback |
+| V21 | `ua_edge/embedded_nul_then_token_found` | `"ab\0Chrome/120..."` explicit len | CHROME + version found end-to-end past the NUL (no NUL-truncation smuggling) |
+
+**Honest out-of-unit-scope** (documented in the test header, NOT faked): the nginx-facing wrappers `ngx_http_heavybag_ua_parse()` (request-ctx population, `ua_parsed` latch, threat-category override) and `ngx_http_heavybag_ua_spoof_eval()` (live JA4 fetch from SSL ex-data + verified-bot CIDR signal) sit behind `#ifndef HEAVYBAG_UA_PARSE_UNIT_TEST` — they need an `ngx_http_request_t` + a TLS connection. The `ja4_signal` contradiction boolean is already mirrored in the existing `spoof` suite; the live JA4 wire walk is Phase 6b. The CR/LF/quote clamp's downstream-sink protection (log_format / add_header) is an integration concern — the core only guarantees the slice TERMINATES at the first out-of-charset byte, which is exactly what V7–V13 assert.
+
+**Verification:** `run-unit-tests.sh` exit 0 — **UA 57/57** (was 36; +21), rate 16/16, JA4 7/7, geo 20/20 (regressions clean). Test-file-only change: no production source edited, no module rebuild, deployed SSL `.so` md5 `c1ddfa3b4772403e8331f843034be16d` (unchanged from Phase 2, build==deploy). The unit harness compiles the UA core with `-Wall` clean (no extra libs).
+
+**Not committed:** partner commits source+tests on main + pushes himself.
