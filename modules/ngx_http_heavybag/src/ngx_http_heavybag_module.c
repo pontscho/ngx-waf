@@ -33,11 +33,14 @@
  * Allocated once in postconfiguration; -1 until then -> $waf_ja4_hash unset.
  */
 static int  ngx_http_heavybag_ja4_ssl_index = -1;
+#endif
 
 /* saved next-in-chain for the opt-in X-WAF-Reason header filter; installed in
- * postconfiguration (see ngx_http_heavybag_reason_header_filter). */
+ * postconfiguration (see ngx_http_heavybag_reason_header_filter). The reason
+ * filter is SSL-independent and is installed/dereferenced unconditionally, so
+ * this pointer MUST live OUTSIDE the NGX_HTTP_SSL guard -- otherwise
+ * --without-http_ssl_module fails to compile the whole .so. */
 static ngx_http_output_header_filter_pt  ngx_http_heavybag_next_reason_filter;
-#endif
 
 
 /*
@@ -77,7 +80,8 @@ ngx_str_t  heavybag_reason_str[HEAVYBAG_REASON_MAX] = {
     ngx_string("cookie"),
     ngx_string("referer"),
     ngx_string("fake_bot"),
-    ngx_string("rate_limit")
+    ngx_string("rate_limit"),
+    ngx_string("spoof")
 };
 
 
@@ -92,6 +96,14 @@ static ngx_conf_enum_t  ngx_http_heavybag_mode[] = {
     { ngx_string("detect"),  HEAVYBAG_MODE_DETECT  },
     { ngx_string("enforce"), HEAVYBAG_MODE_ENFORCE },
     { ngx_string("on"),      HEAVYBAG_MODE_ENFORCE },
+    { ngx_null_string, 0 }
+};
+
+
+/* waf_allowlist_scope full|reputation (see HEAVYBAG_ALLOWLIST_* in the header). */
+static ngx_conf_enum_t  ngx_http_heavybag_allowlist_scope[] = {
+    { ngx_string("full"),       HEAVYBAG_ALLOWLIST_FULL       },
+    { ngx_string("reputation"), HEAVYBAG_ALLOWLIST_REPUTATION },
     { ngx_null_string, 0 }
 };
 
@@ -198,6 +210,25 @@ static ngx_command_t  ngx_http_heavybag_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_heavybag_loc_conf_t, fake_bot_block),
       NULL },
+
+    /* waf_spoof_block on|off: block (403) a request whose UA<->TLS (JA4)
+     * fingerprints disagree (ctx->is_spoofed). detect/enforce is governed by the
+     * master `waf` mode through the finalizer, like the other per-feature flags. */
+    { ngx_string("waf_spoof_block"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_heavybag_loc_conf_t, spoof_block),
+      NULL },
+
+    /* waf_allowlist_scope full|reputation: how far a waf_allowlist CIDR hit
+     * short-circuits the pipeline (full = skip every stage; default full). */
+    { ngx_string("waf_allowlist_scope"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_heavybag_loc_conf_t, allowlist_scope),
+      &ngx_http_heavybag_allowlist_scope },
 
     { ngx_string("waf_scanner_list"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -686,8 +717,10 @@ ngx_http_heavybag_finalize_decision(ngx_http_request_t *r, ngx_http_heavybag_ctx
     ngx_http_heavybag_loc_conf_t *wlcf, ngx_http_heavybag_reason_e reason,
     ngx_int_t block_code)
 {
-    ngx_uint_t                 idx;
+    ngx_uint_t                      idx;
+    ngx_uint_t                      count;
     ngx_http_heavybag_stat_shm_t   *sh;
+    ngx_http_heavybag_stat_vhost_t *v;
     ngx_http_heavybag_srv_conf_t   *wscf;
     ngx_http_heavybag_main_conf_t  *wmcf;
 
@@ -696,12 +729,33 @@ ngx_http_heavybag_finalize_decision(ngx_http_request_t *r, ngx_http_heavybag_ctx
     sh = (wmcf->stat_zone != NULL) ? wmcf->stat_zone->data : NULL;
     idx = (wscf->stat_index < wmcf->nvhosts) ? wscf->stat_index : 0;
 
-    if (wlcf->mode == HEAVYBAG_MODE_DETECT) {
-        ctx->reason = reason;
-        ctx->verdict_set = 1;
+    /*
+     * Count once per client request: internal redirects re-enter PREACCESS on
+     * the same main request (r->internal == 1). The DECISION must re-run (the
+     * URI changed) but the counters must not inflate, so all counting here is
+     * gated on the original (r->internal == 0) hop. ctx->reason is set on every
+     * hop so $waf_reason still renders the verdict. (observability-02)
+     */
+    count = (r->internal == 0);
 
-        if (sh != NULL) {
+    ctx->reason = reason;
+    ctx->verdict_set = 1;
+
+    if (wlcf->mode == HEAVYBAG_MODE_DETECT) {
+        if (sh != NULL && count) {
             (void) ngx_atomic_fetch_add(&sh->http_would_block[reason], 1);
+
+            /*
+             * A detect would-block proceeds, so the request IS allowed: bump
+             * http_allowed (and the vhost slot) too. would_block becomes a pure
+             * overlay and the simple invariant requests_total == allowed +
+             * sum(blocked) holds. (observability-01)
+             */
+            (void) ngx_atomic_fetch_add(&sh->http_allowed, 1);
+            if (idx < sh->nvhosts) {
+                v = ngx_http_heavybag_stat_vhost(sh, idx);
+                (void) ngx_atomic_fetch_add(&v->allowed, 1);
+            }
         }
 
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
@@ -710,7 +764,9 @@ ngx_http_heavybag_finalize_decision(ngx_http_request_t *r, ngx_http_heavybag_ctx
         return NGX_DECLINED;
     }
 
-    ngx_http_heavybag_stat_http_block(sh, idx, ctx, reason, block_code);
+    if (count) {
+        ngx_http_heavybag_stat_http_block(sh, idx, ctx, reason, block_code);
+    }
 
     return block_code;
 }
@@ -773,6 +829,15 @@ ngx_http_heavybag_method_denied(ngx_http_heavybag_loc_conf_t *wlcf,
  * match a "'union" pattern). An empty subject or a failed decode alloc yields
  * NGX_DECLINED (fail-open at the decode step only -- a genuine match still
  * blocks). Returns the scanner_lookup status code, or NGX_DECLINED on no hit.
+ *
+ * SINGLE-PASS DECODE CONTRACT (match-01): the subject is percent-decoded
+ * EXACTLY ONCE before matching, mirroring nginx's own single decode of r->uri.
+ * A double-encoded payload ("%2527union" -> "%27union" after one pass) does NOT
+ * match a pattern written for the once-decoded bytes. This is intentional and
+ * safe ONLY while nothing behind the WAF decodes a second time: the WAF matches
+ * at the same decode depth the upstream sees. Backends MUST NOT percent-decode
+ * request data again after nginx. (If a double-decoding upstream is ever
+ * introduced, a bounded decode-to-fixed-point loop would go here.)
  */
 static ngx_int_t
 ngx_http_heavybag_sig_lookup_decoded(ngx_http_request_t *r, ngx_regex_t **re_bucket,
@@ -888,8 +953,18 @@ ngx_http_heavybag_preaccess_handler(ngx_http_request_t *r)
     /* resolve the shared counters + this vhost's slot (slot 0 fallback) */
     wmcf = ngx_http_get_module_main_conf(r, ngx_http_heavybag_module);
     wscf = ngx_http_get_module_srv_conf(r, ngx_http_heavybag_module);
-    sh = (wmcf->stat_zone != NULL) ? wmcf->stat_zone->data : NULL;
     idx = (wscf->stat_index < wmcf->nvhosts) ? wscf->stat_index : 0;
+
+    /*
+     * Count once per client request: an internal redirect (error_page/try_files/
+     * X-Accel/rewrite-last) re-enters PREACCESS on the SAME main request with
+     * r->internal == 1. Leaving sh NULL on those hops skips every direct counter
+     * bump below (each is guarded by sh != NULL) without touching the security
+     * decision, which does not depend on sh. finalize_decision applies the same
+     * r->internal gate to the block / would-block counters. (observability-02)
+     */
+    sh = (r->internal == 0 && wmcf->stat_zone != NULL)
+         ? wmcf->stat_zone->data : NULL;
 
     /* count this request once, before any verdict is reached */
     if (sh != NULL) {
@@ -943,6 +1018,21 @@ ngx_http_heavybag_preaccess_handler(ngx_http_request_t *r)
         }
 
         return rc;
+    }
+
+    /*
+     * Allowlist full-scope bypass: a waf_allowlist CIDR hit returns DECLINED
+     * with reason ALLOWLIST. With waf_allowlist_scope full (the default) a
+     * trusted IP skips EVERY later stage (method / rate / UA / fake-bot /
+     * scanner / signature / spoof) and is accounted as allowed straight away
+     * ("trusted == trusted"); this also keeps an allowlisted, geo-less IP out of
+     * the default rate bucket (lifecycle-v01). With scope reputation only the
+     * reputation stage was exempted and the request flows on through the rest.
+     */
+    if (verdict.reason == HEAVYBAG_REASON_ALLOWLIST
+        && wlcf->allowlist_scope == HEAVYBAG_ALLOWLIST_FULL)
+    {
+        goto allowed;
     }
 
     /*
@@ -1044,6 +1134,37 @@ ngx_http_heavybag_preaccess_handler(ngx_http_request_t *r)
         }
         if (ctx->is_spoofed) {
             (void) ngx_atomic_fetch_add(&sh->http_ua_spoofed, 1);
+        }
+    }
+
+    /*
+     * UA<->TLS spoof enforcement (waf_spoof_block). ctx->is_spoofed is the
+     * JA4-vs-UA mismatch verdict; until now it only fed a counter and the
+     * $waf_ua_is_spoofed variable (observability-only). With waf_spoof_block on
+     * it becomes a real 403 block, funnelled through the detect-aware finalizer
+     * like every other stage. spoof_eval is lazy/idempotent (spoof_evaluated),
+     * so this re-call is free when the counter block above already ran; it also
+     * covers the no-status-zone case (sh == NULL) where that block is skipped.
+     * Placed after reputation so waf_allowlist (full scope) bypasses it.
+     */
+    if (wlcf->spoof_block) {
+        ngx_http_heavybag_ua_spoof_eval(r, wlcf, ctx);   /* sets ctx->is_spoofed */
+
+        if (ctx->is_spoofed) {
+            if (ngx_http_heavybag_finalize_decision(r, ctx, wlcf,
+                    HEAVYBAG_REASON_SPOOF, NGX_HTTP_FORBIDDEN) == NGX_DECLINED)
+            {
+                return NGX_DECLINED;   /* detect: would-block recorded, allow */
+            }
+
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "heavybag: UA/TLS fingerprint spoof blocked");
+
+            if (verdict.geo_valid) {
+                ngx_http_heavybag_stat_cc_bump(sh, cc16, 1);
+            }
+
+            return NGX_HTTP_FORBIDDEN;
         }
     }
 
@@ -1201,6 +1322,8 @@ ngx_http_heavybag_preaccess_handler(ngx_http_request_t *r)
         }
     }
 
+allowed:
+
     /* allowed: record the (allowlist or none) reason and the allow counters */
     ctx->reason = verdict.reason;
     ctx->verdict_set = 1;
@@ -1243,6 +1366,8 @@ ngx_http_heavybag_create_loc_conf(ngx_conf_t *cf)
     conf->mode = NGX_CONF_UNSET_UINT;
     conf->bot_block = NGX_CONF_UNSET;
     conf->fake_bot_block = NGX_CONF_UNSET;
+    conf->spoof_block = NGX_CONF_UNSET;
+    conf->allowlist_scope = NGX_CONF_UNSET_UINT;
     conf->reason_header = NGX_CONF_UNSET;
 
     return conf;
@@ -1268,6 +1393,9 @@ ngx_http_heavybag_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->mode, prev->mode, HEAVYBAG_MODE_ENFORCE);
     ngx_conf_merge_value(conf->bot_block, prev->bot_block, 0);
     ngx_conf_merge_value(conf->fake_bot_block, prev->fake_bot_block, 0);
+    ngx_conf_merge_value(conf->spoof_block, prev->spoof_block, 0);
+    ngx_conf_merge_uint_value(conf->allowlist_scope, prev->allowlist_scope,
+                              HEAVYBAG_ALLOWLIST_FULL);
     ngx_conf_merge_value(conf->reason_header, prev->reason_header, 0);
 
     /* inherit the compiled buckets when this level defined no list */

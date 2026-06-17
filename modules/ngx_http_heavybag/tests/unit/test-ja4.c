@@ -119,9 +119,11 @@ CTEST(ja4, no_alpn_and_quic)
 
 
 /*
- * Empty signature algorithms: the "_" + sigalg segment is omitted, so the _c
- * hash is taken over an empty string. With every extension excluded (SNI +
- * ALPN + GREASE only) and no sigalgs, _c == sha256("")[:12] == e3b0c44298fc.
+ * ja4-01: with every extension excluded (SNI + ALPN + GREASE only) AND no
+ * sigalgs, the JA4_c input is empty. FoxIO renders an empty list as the literal
+ * "000000000000", NOT sha256("")[:12] (e3b0c44298fc) -- otherwise a spoof /
+ * blocklist lookup keyed on the canonical JA4 misses a degenerate, fully
+ * attacker-controlled ClientHello. This pins the corrected canonical behavior.
  */
 CTEST(ja4, empty_sigalgs_and_exts)
 {
@@ -132,8 +134,31 @@ CTEST(ja4, empty_sigalgs_and_exts)
     ASSERT_EQUAL(0, ngx_http_heavybag_ja4_build(ciphers, 1, exts, 3, NULL, 0,
                      NULL, 0, 0x0304, 0, out));
 
-    /* out = "t13d0100__<jb>_e3b0c44298fc" ; check the trailing _c segment */
-    ASSERT_STR("e3b0c44298fc", out + HEAVYBAG_JA4_LEN - 1 - 12);
+    /* out = "t13d0100_<jb>_000000000000" ; check the trailing _c segment */
+    ASSERT_STR("000000000000", out + HEAVYBAG_JA4_LEN - 1 - 12);
+}
+
+
+/*
+ * ja4-01 (cipher side): an empty cipher list (only GREASE / no ciphers) must
+ * render JA4_b as the literal "000000000000", not sha256("")[:12]. JA4_b
+ * occupies out[11..22] -- after the 10-char _a segment and its '_'. A real
+ * extension is supplied so only the cipher field is exercised.
+ */
+CTEST(ja4, empty_ciphers_canonical_zeros)
+{
+    static const uint16_t  ciphers[] = { 0x0a0a, 0x1a1a };  /* all GREASE */
+    static const uint16_t  exts[]    = { 0x000d };          /* one real ext */
+    char  out[HEAVYBAG_JA4_LEN];
+
+    ASSERT_EQUAL(0, ngx_http_heavybag_ja4_build(ciphers, 2, exts, 1, NULL, 0,
+                     NULL, 0, 0x0304, 0, out));
+
+    /* cipher count field (bytes 4-5) is "00" */
+    ASSERT_EQUAL('0', out[4]);
+    ASSERT_EQUAL('0', out[5]);
+    /* JA4_b (out[11..22]) is the canonical literal zeros */
+    ASSERT_EQUAL(0, memcmp(out + 11, "000000000000", 12));
 }
 
 

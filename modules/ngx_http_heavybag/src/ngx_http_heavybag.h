@@ -70,6 +70,17 @@ typedef enum {
 
 
 /*
+ * waf_allowlist_scope: how far a waf_allowlist CIDR hit short-circuits the
+ * decision pipeline. FULL (default) treats a trusted IP as trusted everywhere
+ * -- it skips every later stage. REPUTATION exempts only the reputation stage
+ * (the paranoid posture), leaving method / rate / UA / fake-bot / scanner /
+ * signature / spoof to still run.
+ */
+#define HEAVYBAG_ALLOWLIST_FULL        0
+#define HEAVYBAG_ALLOWLIST_REPUTATION  1
+
+
+/*
  * Per-{http,server,location} configuration.
  *
  * The module carries no shared writable state: the geo database is
@@ -96,6 +107,7 @@ typedef struct {
     ngx_array_t                   *verified_bot_cidrs[HEAVYBAG_UA_LIST_MAX];
     ngx_str_t                      verified_bot_list[HEAVYBAG_UA_LIST_MAX];
     ngx_flag_t                     fake_bot_block; /* waf_fake_bot_block on|off */
+    ngx_flag_t                     spoof_block;  /* waf_spoof_block on|off (UA<->JA4) */
 
     /* args/cookie/referer signatures: one action-bucketed row per subject */
     ngx_str_t        sig_list[HEAVYBAG_SIG_LIST_MAX];   /* dup-guard / merge sentinel */
@@ -110,6 +122,7 @@ typedef struct {
     ngx_flag_t                     reason_header;
 
     ngx_heavybag_rep_conf_t             rep;          /* geo / CC / flags / CIDRs */
+    ngx_uint_t                     allowlist_scope; /* waf_allowlist_scope full|reputation */
     ngx_array_t                   *trusted_proxy;/* ngx_cidr_t for XFF (HTTP) */
 
     /* HTTP method filter (waf_method_allow / waf_method_deny -> 404) */

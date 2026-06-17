@@ -59,6 +59,7 @@ typedef enum {
     HEAVYBAG_REASON_REFERER,        /* Referer signature (404/403/444)      */
     HEAVYBAG_REASON_FAKE_BOT,       /* claimed crawler outside published CIDR (403) */
     HEAVYBAG_REASON_RATE_LIMIT,     /* per-IP token-bucket over limit (429)         */
+    HEAVYBAG_REASON_SPOOF,          /* UA<->TLS (JA4) fingerprint mismatch (403)    */
     HEAVYBAG_REASON_MAX
 } ngx_http_heavybag_reason_e;
 

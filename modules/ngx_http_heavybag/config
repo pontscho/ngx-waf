@@ -31,14 +31,26 @@ heavybag_srcs="$ngx_addon_dir/src/ngx_http_heavybag_module.c \
          $ngx_addon_dir/src/heavybag_reputation.c \
          $ngx_addon_dir/src/heavybag_rate.c \
          $ngx_addon_dir/src/heavybag_authhttp.c \
-         $ngx_addon_dir/src/heavybag_stream.c \
          $ngx_addon_dir/src/heavybag_status.c \
          $ngx_addon_dir/src/heavybag_ja4.c \
          $ngx_addon_dir/src/heavybag_ua_parse.c"
 
+# The L4 stream head (heavybag_stream.c -> ngx_stream_heavybag_module) only
+# exists when nginx is built --with-stream. addon config runs from auto/modules
+# AFTER the STREAM decision, so $STREAM is final here (NO|YES|DYNAMIC).
+# Compiling heavybag_stream.c (it #include <ngx_stream.h>) or naming the stream
+# module without stream support breaks the whole .so build, so gate both.
+if [ "$STREAM" != NO ]; then
+    heavybag_srcs="$heavybag_srcs $ngx_addon_dir/src/heavybag_stream.c"
+fi
+
 if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
-    ngx_module_name="ngx_http_heavybag_module ngx_stream_heavybag_module"
+    if [ "$STREAM" != NO ]; then
+        ngx_module_name="ngx_http_heavybag_module ngx_stream_heavybag_module"
+    else
+        ngx_module_name=ngx_http_heavybag_module
+    fi
     ngx_module_incs="$ngx_addon_dir/src"
     ngx_module_deps="$heavybag_deps"
     ngx_module_srcs="$heavybag_srcs"
@@ -46,7 +58,9 @@ if test -n "$ngx_module_link"; then
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_heavybag_module"
-    STREAM_MODULES="$STREAM_MODULES ngx_stream_heavybag_module"
+    if [ "$STREAM" != NO ]; then
+        STREAM_MODULES="$STREAM_MODULES ngx_stream_heavybag_module"
+    fi
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $heavybag_deps"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS $heavybag_srcs"
     CORE_INCS="$CORE_INCS $ngx_addon_dir/src"

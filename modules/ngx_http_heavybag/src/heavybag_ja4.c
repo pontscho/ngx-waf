@@ -226,11 +226,19 @@ ngx_http_heavybag_ja4_build(const uint16_t *ciphers, size_t n_ciphers,
     if (n > 1) {
         qsort(list, n, sizeof(uint16_t), ja4_cmp_u16);
     }
-    pos = 0;
-    csv[0] = '\0';
-    ja4_append_hex_csv(csv, sizeof(csv), &pos, list, n);
-    if (ja4_sha256_hex12(csv, pos, jb) != 0) {
-        return -1;
+    if (n == 0) {
+        /* FoxIO canonical: an empty cipher list renders as the literal
+         * "000000000000", NOT SHA256("") (e3b0c44298fc). A blocklist / spoof
+         * check keyed on the canonical JA4 must see the same zeros FoxIO
+         * emits, or an only-GREASE / no-cipher ClientHello evades it. */
+        memcpy(jb, "000000000000", sizeof("000000000000"));
+    } else {
+        pos = 0;
+        csv[0] = '\0';
+        ja4_append_hex_csv(csv, sizeof(csv), &pos, list, n);
+        if (ja4_sha256_hex12(csv, pos, jb) != 0) {
+            return -1;
+        }
     }
 
     /* --- JA4_c: sorted exts (no SNI/ALPN/GREASE) + "_" + sigalgs ------- */
@@ -254,18 +262,24 @@ ngx_http_heavybag_ja4_build(const uint16_t *ciphers, size_t n_ciphers,
         ns = ja4_filter_grease(sigalgs, n_sigalgs, sig, HEAVYBAG_JA4_MAX_ELEMS);
     }
 
-    pos = 0;
-    csv[0] = '\0';
-    ja4_append_hex_csv(csv, sizeof(csv), &pos, list, n);
-    if (ns > 0) {
-        if (pos + 1 < sizeof(csv)) {
-            csv[pos++] = '_';
-            csv[pos] = '\0';
+    if (n == 0 && ns == 0) {
+        /* FoxIO canonical: no extensions AND no sigalgs -> literal zeros,
+         * not SHA256(""). Same evasion concern as JA4_b above. */
+        memcpy(jc, "000000000000", sizeof("000000000000"));
+    } else {
+        pos = 0;
+        csv[0] = '\0';
+        ja4_append_hex_csv(csv, sizeof(csv), &pos, list, n);
+        if (ns > 0) {
+            if (pos + 1 < sizeof(csv)) {
+                csv[pos++] = '_';
+                csv[pos] = '\0';
+            }
+            ja4_append_hex_csv(csv, sizeof(csv), &pos, sig, ns);
         }
-        ja4_append_hex_csv(csv, sizeof(csv), &pos, sig, ns);
-    }
-    if (ja4_sha256_hex12(csv, pos, jc) != 0) {
-        return -1;
+        if (ja4_sha256_hex12(csv, pos, jc) != 0) {
+            return -1;
+        }
     }
 
     (void) snprintf(out, HEAVYBAG_JA4_LEN, "%s_%s_%s", a, jb, jc);
@@ -284,12 +298,19 @@ ngx_http_heavybag_ja4_build(const uint16_t *ciphers, size_t n_ciphers,
  * SSL* and feeds ngx_http_heavybag_ja4_build(); the client_hello callback + SSL_CTX
  * wiring (task-015) live in ngx_http_heavybag_module.c. Implemented in later tasks;
  * the includes are staged here so those additions drop straight in.
+ *
+ * The whole extractor (and the SSL_is_quic call it contains) requires OpenSSL.
+ * Gate it on NGX_HTTP_SSL so --without-http_ssl_module builds skip it cleanly.
+ * NGX_HTTP_SSL is set by ngx_auto_config.h (pulled in via ngx_config.h), so the
+ * guard must come AFTER that include.
  * ---------------------------------------------------------------------------
  */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <openssl/ssl.h>
+
+#if (NGX_HTTP_SSL)
 
 
 /* GREASE test, duplicated here so the extractor needs no core helper. */
@@ -420,5 +441,7 @@ cleanup:
 
     return rc;
 }
+
+#endif /* NGX_HTTP_SSL */
 
 #endif /* HEAVYBAG_JA4_UNIT_TEST */

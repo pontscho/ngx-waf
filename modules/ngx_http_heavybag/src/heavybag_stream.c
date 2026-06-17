@@ -24,6 +24,16 @@
 #include "heavybag_rep.h"
 #include "heavybag_rate.h"
 
+/*
+ * NOTE: nginx defines NO `NGX_STREAM` preprocessor macro, so this whole
+ * translation unit must NOT be wrapped in `#if (NGX_STREAM)` (that is always
+ * false and silently drops ngx_stream_heavybag_module, breaking dlopen with an
+ * undefined symbol). Stream availability is gated entirely by the addon
+ * `config`, which compiles this file and registers ngx_stream_heavybag_module
+ * only when nginx is built --with-stream ([ "$STREAM" != NO ]); a
+ * --without-stream build simply never compiles this file. (config-build-001)
+ */
+
 
 /*
  * The status shm zone is owned by the HTTP head (ngx_http_heavybag_module sizes
@@ -45,6 +55,15 @@ static ngx_shm_zone_t  *ngx_stream_heavybag_stat_zone;
  * declared in http{}.
  */
 static ngx_shm_zone_t  *ngx_stream_heavybag_rate_zone;
+
+/*
+ * Set when any stream server configures waf_stream_rate_limit. init_module runs
+ * after the WHOLE config (both heads) is parsed -- so it is block-order
+ * independent and also runs under `nginx -t` -- and uses this to WARN when rate
+ * limiting is requested but waf_rate_zone was never declared in http{}. Reset at
+ * the end of init_module so a reload that drops the rules clears the flag.
+ */
+static ngx_uint_t  ngx_stream_heavybag_rate_wanted;
 
 
 typedef struct {
@@ -70,6 +89,9 @@ static void *ngx_stream_heavybag_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_heavybag_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_stream_heavybag_init(ngx_conf_t *cf);
+static ngx_int_t ngx_stream_heavybag_init_module(ngx_cycle_t *cycle);
+static ngx_shm_zone_t *ngx_stream_heavybag_resolve_http_zone(ngx_cycle_t *cycle,
+    ngx_str_t *name);
 
 static char *ngx_stream_heavybag_set_geo_db(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -176,7 +198,7 @@ ngx_module_t  ngx_stream_heavybag_module = {
     ngx_stream_heavybag_commands,           /* module directives */
     NGX_STREAM_MODULE,                 /* module type */
     NULL,                              /* init master */
-    NULL,                              /* init module */
+    ngx_stream_heavybag_init_module,        /* init module */
     NULL,                              /* init process */
     NULL,                              /* init thread */
     NULL,                              /* exit thread */
@@ -368,9 +390,96 @@ ngx_stream_heavybag_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
 
 /*
- * STREAM postconfiguration: register the ACCESS-phase connection handler and
- * resolve (never create) the HTTP module's shared waf_status zone by name so
- * the stream handler can update the same counters the HTTP side owns.
+ * Resolve a shared-memory zone owned by the HTTP head (matched by name + the
+ * HTTP module tag) by walking the already-registered list. Returns NULL when
+ * the zone was never registered -- e.g. a stream-only config (no http{}, or an
+ * http{} without the heavybag HTTP head / without waf_rate_zone).
+ *
+ * We must NOT fall back to ngx_shared_memory_add(cf, name, 0, ...): when the
+ * zone is absent that CREATES a fresh zero-size entry, and nginx fatally
+ * rejects a zero-size shared zone at startup (this was the stream-only fatal
+ * abort, sharedmem-01). A NULL result instead degrades gracefully -- status
+ * counters no-op, rate limiting fail-opens.
+ */
+static ngx_shm_zone_t *
+ngx_stream_heavybag_resolve_http_zone(ngx_cycle_t *cycle, ngx_str_t *name)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_shm_zone_t   *zone;
+
+    part = &cycle->shared_memory.part;
+    zone = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            zone = part->elts;
+            i = 0;
+        }
+
+        if (zone[i].shm.name.len == name->len
+            && ngx_strncmp(zone[i].shm.name.data, name->data, name->len) == 0
+            && zone[i].tag == &ngx_http_heavybag_module)
+        {
+            return &zone[i];
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * init_module runs once the WHOLE configuration (both the http{} and stream{}
+ * blocks, in any order) has been parsed, and also runs under `nginx -t`. That
+ * makes it the only correct place to resolve the HTTP head's shared zones:
+ * resolving them in stream postconfig is order-dependent (an http{} block after
+ * stream{} has not registered its zones yet -> silent fail-open, sharedmem-02).
+ * Pointers set here in the master are inherited by workers on fork.
+ */
+static ngx_int_t
+ngx_stream_heavybag_init_module(ngx_cycle_t *cycle)
+{
+    ngx_str_t  status_name = ngx_string("waf_status");
+    ngx_str_t  rate_name = ngx_string("waf_rate");
+
+    ngx_stream_heavybag_stat_zone =
+        ngx_stream_heavybag_resolve_http_zone(cycle, &status_name);
+    ngx_stream_heavybag_rate_zone =
+        ngx_stream_heavybag_resolve_http_zone(cycle, &rate_name);
+
+    /*
+     * Mirror the HTTP head's nginx -t guard (which rejects waf_rate_limit with
+     * no waf_rate_zone). The stream setter cannot reject at parse time because
+     * the zone lives in a different block, so warn here instead -- loudly, and
+     * during `nginx -t` -- that stream rate limiting is silently disabled
+     * (sharedmem-03 / config-02).
+     */
+    if (ngx_stream_heavybag_rate_wanted
+        && ngx_stream_heavybag_rate_zone == NULL)
+    {
+        ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                      "heavybag: waf_stream_rate_limit is configured but no "
+                      "waf_rate_zone is declared in http{} -- stream rate "
+                      "limiting is DISABLED (fail-open); declare waf_rate_zone "
+                      "in http{} to enable it");
+    }
+
+    ngx_stream_heavybag_rate_wanted = 0;   /* reset for the next (reload) cycle */
+
+    return NGX_OK;
+}
+
+
+/*
+ * STREAM postconfiguration: register the ACCESS-phase connection handler. The
+ * shared waf_status / waf_rate zones are resolved later, in init_module (see
+ * above) -- doing it here would be sensitive to http{}/stream{} block order.
  */
 static ngx_int_t
 ngx_stream_heavybag_init(ngx_conf_t *cf)
@@ -386,64 +495,6 @@ ngx_stream_heavybag_init(ngx_conf_t *cf)
     }
 
     *h = ngx_stream_heavybag_handler;
-
-    /*
-     * Resolve (never create) the HTTP head's status zone: size 0 so core
-     * skips the size-conflict check and matches the existing zone by
-     * name + tag. Set NO init here - a second init would clobber the HTTP
-     * head's allocation. The handler reads zone->data once it is populated.
-     */
-    {
-        ngx_str_t  name = ngx_string("waf_status");
-
-        ngx_stream_heavybag_stat_zone = ngx_shared_memory_add(cf, &name, 0,
-                                                       &ngx_http_heavybag_module);
-        if (ngx_stream_heavybag_stat_zone == NULL) {
-            return NGX_ERROR;
-        }
-    }
-
-    /*
-     * Resolve (never create) the HTTP head's per-IP rate-limit zone.
-     * Unlike the waf_status zone, waf_rate is optional -- it only exists if
-     * http{} contains a waf_rate_zone directive.  ngx_shared_memory_add with
-     * size=0 would create a new zero-size entry when the zone is absent, and
-     * nginx then fatally rejects a zero-size zone at startup.  Instead walk the
-     * already-registered shared-memory list and set the pointer only when the
-     * zone has already been registered by the HTTP head; leave it NULL otherwise
-     * so the stream rate-check simply fail-opens.
-     */
-    {
-        ngx_str_t         name = ngx_string("waf_rate");
-        ngx_uint_t        i;
-        ngx_list_part_t  *part;
-        ngx_shm_zone_t   *zone;
-
-        ngx_stream_heavybag_rate_zone = NULL;
-
-        part = &cf->cycle->shared_memory.part;
-        zone = part->elts;
-
-        for (i = 0; /* void */; i++) {
-
-            if (i >= part->nelts) {
-                if (part->next == NULL) {
-                    break;
-                }
-                part = part->next;
-                zone = part->elts;
-                i = 0;
-            }
-
-            if (zone[i].shm.name.len == name.len
-                && ngx_strncmp(zone[i].shm.name.data, name.data, name.len) == 0
-                && zone[i].tag == &ngx_http_heavybag_module)
-            {
-                ngx_stream_heavybag_rate_zone = &zone[i];
-                break;
-            }
-        }
-    }
 
     return NGX_OK;
 }
@@ -612,6 +663,9 @@ static char *
 ngx_stream_heavybag_set_rate_limit(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_stream_heavybag_srv_conf_t  *sscf = conf;
+
+    /* flag init_module's "rate configured but no waf_rate zone" WARN check */
+    ngx_stream_heavybag_rate_wanted = 1;
 
     return ngx_http_heavybag_rate_rule_add(cf, &sscf->rate_rules);
 }
