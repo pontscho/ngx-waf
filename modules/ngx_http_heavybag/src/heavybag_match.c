@@ -34,6 +34,57 @@ static ngx_int_t ngx_http_heavybag_compile_bucket(ngx_conf_t *cf,
 
 
 /*
+ * Bounded regex exec. nginx's ngx_regex_exec() wrapper calls pcre2_match()
+ * with a DEFAULT match context (no match/depth limit), so a pathological
+ * operator-authored pattern on a crafted subject is a latent quadratic
+ * CPU foot-gun. nginx exposes no match-limit knob, so we bypass the wrapper
+ * with a module-local match context carrying explicit limits.
+ *
+ * On MATCHLIMIT/DEPTHLIMIT pcre2_match() returns negative -> treated as
+ * no-match (fail-open): the CPU is bounded and legit traffic is not blocked
+ * because an operator's pattern blew the limit (a config problem, not a
+ * request). The statics are per-worker, single-threaded -> safe; they live
+ * for the process lifetime (reclaimed at exit, like nginx's own global
+ * ngx_regex_match_data) -- deliberately no exit_process handler for two
+ * tiny objects. The PCRE1 path keeps working via the wrapper.
+ */
+#if (NGX_PCRE2)
+#define HEAVYBAG_PCRE2_MATCH_LIMIT  100000   /* bound backtracking steps */
+#define HEAVYBAG_PCRE2_DEPTH_LIMIT  1000     /* bound recursion depth */
+static pcre2_match_context  *heavybag_mctx;
+static pcre2_match_data     *heavybag_mdata;
+
+static ngx_int_t
+ngx_http_heavybag_regex_exec(ngx_regex_t *re, ngx_str_t *s)
+{
+    int  rc;
+
+    if (heavybag_mctx == NULL) {
+        heavybag_mctx = pcre2_match_context_create(NULL);
+        if (heavybag_mctx == NULL) {
+            return ngx_regex_exec(re, s, NULL, 0);   /* OOM -> wrapper */
+        }
+        pcre2_set_match_limit(heavybag_mctx, HEAVYBAG_PCRE2_MATCH_LIMIT);
+        pcre2_set_depth_limit(heavybag_mctx, HEAVYBAG_PCRE2_DEPTH_LIMIT);
+    }
+    if (heavybag_mdata == NULL) {
+        heavybag_mdata = pcre2_match_data_create(1, NULL);   /* boolean match */
+        if (heavybag_mdata == NULL) {
+            return ngx_regex_exec(re, s, NULL, 0);
+        }
+    }
+
+    rc = pcre2_match((pcre2_code *) re, s->data, s->len, 0, 0,
+                     heavybag_mdata, heavybag_mctx);
+
+    return (ngx_int_t) rc;   /* >=0 match; <0 NOMATCH/MATCHLIMIT/DEPTHLIMIT */
+}
+#else
+#define ngx_http_heavybag_regex_exec(re, s)  ngx_regex_exec((re), (s), NULL, 0)
+#endif
+
+
+/*
  * Config-time: resolve path against the prefix, open and stat it, and read
  * the whole file into a temp-pool buffer returned via out. Logs and returns
  * NGX_ERROR on any open/stat/short-read failure.
@@ -212,7 +263,7 @@ ngx_int_t
 ngx_http_heavybag_scanner_compile(ngx_conf_t *cf, ngx_str_t *path,
     ngx_regex_t **re_bucket)
 {
-    u_char       *p, *end, *ls, *le, *ps, *pe, *as;
+    u_char       *p, *end, *ls, *le, *ps, *pe, *as, *ae;
     ngx_str_t     content, *pat, action;
     ngx_uint_t    i, bucket, total;
     ngx_array_t  *buckets[HEAVYBAG_ACTION_MAX];
@@ -246,11 +297,24 @@ ngx_http_heavybag_scanner_compile(ngx_conf_t *cf, ngx_str_t *path,
             as++;
         }
 
+        /*
+         * Action token = [as, ae): the action region minus an optional inline
+         * comment, right-trimmed. The pattern (before pe) is untouched, so a
+         * '#' inside a pattern is safe -- only the action region is stripped.
+         */
+        ae = as;
+        while (ae < le && *ae != '#') {
+            ae++;
+        }
+        while (ae > as && (ae[-1] == ' ' || ae[-1] == '\t')) {
+            ae--;
+        }
+
         bucket = HEAVYBAG_ACTION_404;
 
-        if (as < le) {
+        if (ae > as) {
             action.data = as;
-            action.len = le - as;
+            action.len = ae - as;
 
             if (action.len == 3 && ngx_strncmp(action.data, "403", 3) == 0) {
                 bucket = HEAVYBAG_ACTION_403;
@@ -266,9 +330,11 @@ ngx_http_heavybag_scanner_compile(ngx_conf_t *cf, ngx_str_t *path,
                 bucket = HEAVYBAG_ACTION_404;
 
             } else {
-                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                    "heavybag: unknown action \"%V\" in scanner list, using 404",
-                    &action);
+                /* a genuine typo is fail-closed: abort the config, never
+                 * silently degrade a mis-typed 403/444 rule to 404 */
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "heavybag: unknown action \"%V\" in scanner list", &action);
+                return NGX_ERROR;
             }
         }
 
@@ -308,7 +374,7 @@ ngx_http_heavybag_scanner_lookup(ngx_regex_t **re_bucket, ngx_str_t *subject)
             continue;
         }
 
-        if (ngx_regex_exec(re_bucket[i], subject, NULL, 0) >= 0) {
+        if (ngx_http_heavybag_regex_exec(re_bucket[i], subject) >= 0) {
             return (ngx_int_t) heavybag_action_code[i];
         }
     }
@@ -586,7 +652,7 @@ ngx_http_heavybag_ua_classify(ngx_http_request_t *r, ngx_http_heavybag_loc_conf_
             continue;
         }
 
-        if (ngx_regex_exec(wlcf->ua_re[i], &ua, NULL, 0) >= 0) {
+        if (ngx_http_heavybag_regex_exec(wlcf->ua_re[i], &ua) >= 0) {
             ctx->ua = (ngx_http_heavybag_ua_e) i;
             return;
         }

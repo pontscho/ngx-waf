@@ -1398,13 +1398,6 @@ ngx_http_heavybag_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                               HEAVYBAG_ALLOWLIST_FULL);
     ngx_conf_merge_value(conf->reason_header, prev->reason_header, 0);
 
-    /* inherit the compiled buckets when this level defined no list */
-    for (i = 0; i < HEAVYBAG_ACTION_MAX; i++) {
-        if (conf->scanner_re[i] == NULL) {
-            conf->scanner_re[i] = prev->scanner_re[i];
-        }
-    }
-
     /* same inherit-when-NULL for the UA classification regex slots */
     for (i = 0; i < HEAVYBAG_UA_LIST_MAX; i++) {
         if (conf->ua_re[i] == NULL) {
@@ -1412,8 +1405,17 @@ ngx_http_heavybag_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         }
     }
 
+    /*
+     * Inherit the scanner buckets as one unit, gated on the list sentinel: a
+     * child that defines ANY scanner list owns all three buckets (no parent
+     * 403/444 leak); a child with no list inherits all of them -- the sig_re
+     * model below.
+     */
     if (conf->scanner_list.data == NULL) {
         conf->scanner_list = prev->scanner_list;
+        for (i = 0; i < HEAVYBAG_ACTION_MAX; i++) {
+            conf->scanner_re[i] = prev->scanner_re[i];
+        }
     }
 
     /* inherit each whole sig_re[] row when this level defined no such list */

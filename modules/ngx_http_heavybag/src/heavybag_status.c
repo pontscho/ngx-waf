@@ -369,6 +369,7 @@ ngx_http_heavybag_status_json(u_char *p, u_char *last,
     ngx_http_heavybag_geo_db_t *geo_db, ngx_atomic_uint_t rate_overflow)
 {
     u_char                      cc[2];
+    size_t                      need;
     time_t                      now;
     ngx_str_t                  *name;
     ngx_uint_t                  i, idx, first;
@@ -495,7 +496,8 @@ ngx_http_heavybag_status_json(u_char *p, u_char *last,
         name = &cscfp[idx]->server_name;
 
         p = ngx_snprintf(p, last - p, "%s{\"server\":\"", idx ? "," : "");
-        if (last - p > 0) {
+        need = ngx_escape_json(NULL, name->data, name->len);   /* measured escaped len */
+        if ((size_t) (last - p) >= need) {
             p = (u_char *) ngx_escape_json(p, name->data, name->len);
         }
         p = ngx_snprintf(p, last - p,
@@ -574,9 +576,16 @@ ngx_http_heavybag_status_prometheus(u_char *p, u_char *last,
                          (ngx_atomic_uint_t) snap->http_would_block[i]);
     }
 
+    /*
+     * Per-flag breakdown under a DISTINCT metric name (not the blocked_total
+     * series): http_blocked[FLAG] bumps once per blocked request, flag_blocked[]
+     * once per matched flag BIT, so re-using blocked_total here would make
+     * sum(heavybag_http_blocked_total) double-count flag blocks. This is a
+     * per-bit breakdown by design -- it does NOT sum to the flag aggregate.
+     */
     for (i = 0; i < HEAVYBAG_FLAG_SLOTS; i++) {
         p = ngx_snprintf(p, last - p,
-            "heavybag_http_blocked_total{reason=\"flag\",flag=\"%s\"} %uA\n",
+            "heavybag_http_blocked_flag_total{flag=\"%s\"} %uA\n",
             heavybag_flag_label[i],
             (ngx_atomic_uint_t) snap->flag_blocked[i]);
     }

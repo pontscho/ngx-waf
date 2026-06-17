@@ -149,6 +149,20 @@ ngx_http_heavybag_rate_check(void *shm, struct sockaddr *sa,
         return NGX_OK;
     }
 
+    if (period_ms == 0) {
+        return NGX_OK;                       /* exported API: avoid div-by-zero -> fail-open */
+    }
+    if (burst_fp == 0) {                     /* exported API: 0 burst would fail closed -> fail-open */
+        static ngx_uint_t  warned;           /* one-time: a zeroed param is a CALLER bug, surface it */
+        if (!warned) {
+            warned = 1;
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                "heavybag: rate_check called with burst_fp==0 "
+                "(rate limiting disabled for this caller)");
+        }
+        return NGX_OK;
+    }
+
     slots = (ngx_http_heavybag_rate_slot_t *) (hdr + 1);
     idx = (ngx_uint_t) (h % n);
     s = NULL;

@@ -905,7 +905,7 @@ heavybag_uptime_seconds 3812
 heavybag_http_requests_total 19443
 heavybag_http_blocked_total{reason="blocklist"} 51
 heavybag_http_blocked_total{reason="scanner_path"} 1208
-heavybag_http_blocked_total{reason="flag",flag="anycast"} 17
+heavybag_http_blocked_flag_total{flag="anycast"} 17
 heavybag_country_blocked_total{country="CN"} 904
 ```
 
