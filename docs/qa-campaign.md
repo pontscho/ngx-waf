@@ -718,4 +718,30 @@ The campaign critic flagged four surfaces it had not fuzzed to the depth of the 
 
 **Verdict:** **no production defect.** The handler is robust against every malformed/hostile `Client-IP` (clean fail-open, no crash, no reflection), the untrusted-peer trust boundary holds, the v6 path works, and all five reputation reasons map correctly into `Auth-Status`. Purely additive test coverage — **no `src/*.c`/`*.h` edited; deployed SSL `.so` md5 `03a216df17d1661854e8287045050eb8` unchanged** (build==deploy). New files: `tests/run-mailauth-fuzz.sh`, `tests/heavybag-mailauth-fuzz.conf`, +1 CTest registration in `cmake/Tests.cmake`. Unit/integration totals rise to: integration now includes mailauth (32). CTest test count 10 -> 11 (`heavybag_mailauth`).
 
-**Still un-probed (optional, separate rounds):** spoof self-swap (the JA4↔UA family-mismatch matrix), reputation verdict-precedence (multi-source collisions: which reason wins when an IP hits blocklist + geo + ASN simultaneously), stat_cc table saturation (513+ distinct country codes -> `cc_overflow` silent-drop path). Each is green-but-shallow, not a known bug.
+**Still un-probed (optional, separate rounds):** spoof self-swap (the JA4↔UA family-mismatch matrix), stat_cc table saturation (513+ distinct country codes -> `cc_overflow` silent-drop path). Each is green-but-shallow, not a known bug. (reputation verdict-precedence CLOSED — see below.)
+
+---
+
+## Optional round — reputation verdict-precedence (2026-06-19)
+
+Closes the critic's second un-probed surface. `ngx_http_heavybag_reputation_check()` (`heavybag_reputation.c`) is a strict **first-match-wins, early-return** pipeline; every prior reputation test was single-source (one IP matching exactly one of blocklist / geo / ASN / flag). This round builds **collisions** — one IP matching MULTIPLE sources at once — and asserts the documented order. Crucially, every collision is backed by single-source **controls** proving the lower-priority source fires alone for that IP, so a collision result genuinely proves ordering (not a silently-non-matching source).
+
+**Surface:** the shared verdict pipeline (`heavybag_reputation.c:50/61/98/109/126/148/170/182`). New harness `tests/run-reputation-precedence.sh` + `tests/heavybag-repprec-test.conf` (one vhost, port 28701, 16 `location =` probes), registered as CTest `heavybag_repprec`. Driven over the HTTP PREACCESS path (`waf_trusted_proxy 127.0.0.1` + spoofed `X-Forwarded-For` inject the client IP; `waf_reason_header on` exposes `ctx->reason` as `X-WAF-Reason`). reputation_check is shared verbatim by the mail + stream heads, so HTTP coverage is authoritative. Each location is backed by a real `$document_root/p-<name>` file (runner-created) so an ALLOWED request is served in place — no `try_files` internal redirect that would clear `ctx->reason` (the [[nginx-ctx-cleared-on-internal-redirect]] landmine), making `X-WAF-Reason` readable for allowed verdicts too. **19/19 PASS.** Geo-centric: SKIPs (exit 2 -> CTest SKIPPED) if geodb/oracle is absent or its ground truth has drifted from the baked conf.
+
+Ground-truth IPs (oracle-validated at runtime): `185.177.72.1` FR/AS211590/0x0000 (geo+asn, no flag bit); `8.8.8.8` US/AS15169/0x0004 anycast (flag+asn+geo); `185.220.101.1` DE/AS60729/0x0001 anonymous-proxy (flag+asn+geo).
+
+| Vector | Setup (one IP, multiple sources) | Verdict | Proves |
+|---|---|---|---|
+| controls | geo US/FR; asn 15169/211590/60729; flag anycast/anon-proxy — each ALONE | each -> 403 + its own reason | every source fires independently |
+| R1 | allowlist + blocklist (both list 185.177.72.1) | 200 `allowlist` | **allowlist > blocklist** (step0>step1) |
+| R2 | blocklist + flag + asn + geo (all match 8.8.8.8) | 403 `blocklist` | **blocklist > flag/asn/geo** (step1 first) |
+| R3 | flag(anycast) + asn(15169) on 8.8.8.8 | 403 `flag` | **flag > ASN** (step4>step5) |
+| R4 | flag(anycast) + geo(US) on 8.8.8.8 | 403 `flag` | **flag > block_cc** (step4>step8) |
+| R5 | asn(211590) + geo(FR) on 185.177.72.1 (0x0000) | 403 `asn` | **ASN > block_cc** (step5>step8), clean (no flag) |
+| R6a | geo_whitelist HU, IP US (found, not HU) | 404 `geo_whitelist` | whitelist-miss control |
+| R6b | blocklist + geo_whitelist HU on 8.8.8.8 | 403 `blocklist` | **blocklist > geo-whitelist** (step1>step7) |
+| R8 | flag(anonymous-proxy) + asn(60729) on 185.220.101.1 | 403 `flag` | **flag > ASN** across a 2nd flag bit |
+
+**Verdict:** **no production defect.** The precedence is exactly as documented and deterministic across every collision; the controls confirm each lower-priority source would otherwise fire. Purely additive: **no `src/*.c`/`*.h` edited; deployed SSL `.so` md5 `03a216df17d1661854e8287045050eb8` unchanged**. New files: `tests/run-reputation-precedence.sh`, `tests/heavybag-repprec-test.conf`, +1 CTest registration (`heavybag_repprec`; CTest count 11 -> 12).
+
+**Still un-probed (optional):** spoof self-swap (JA4↔UA family-mismatch matrix), stat_cc table saturation (513+ distinct CCs -> `cc_overflow`). Both green-but-shallow, not known bugs.
