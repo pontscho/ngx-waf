@@ -5,9 +5,12 @@
 # the .so after the first entry in ngx_module_name and compiles every listed
 # module into it; each module declares its own type at runtime.
 #
-# No external libraries: PCRE2 comes from nginx's own ngx_regex (already
-# linked), and the geo reader is the embedded nanolibloc adaptation (libc
-# only). ngx_module_libs stays empty. Requires nginx built --with-stream.
+# PCRE2 comes from nginx's own ngx_regex (already linked). The geo reader is
+# the embedded nanolibloc adaptation, but it verifies the location.db signature
+# (ECDSA P-521 / SHA-512) with OpenSSL libcrypto (EVP/PEM), so ngx_module_libs
+# must carry -lcrypto -- otherwise an nginx built --without-http_ssl_module (and
+# with no other libcrypto consumer) hits undefined EVP_*/PEM_* symbols at
+# dlopen. Requires nginx built --with-stream.
 
 ngx_addon_name=ngx_http_heavybag_module
 
@@ -54,7 +57,7 @@ if test -n "$ngx_module_link"; then
     ngx_module_incs="$ngx_addon_dir/src"
     ngx_module_deps="$heavybag_deps"
     ngx_module_srcs="$heavybag_srcs"
-    ngx_module_libs=
+    ngx_module_libs="-lcrypto"   # geo.c: location.db ECDSA-P521/SHA-512 verify
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_heavybag_module"

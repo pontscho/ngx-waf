@@ -118,6 +118,20 @@ sym_tree() {
         [ "$n" -eq 0 ] && ok "$label: ZERO undefined SSL_* symbols (ja4ssl-build-001 holds)" \
             || bad "$label: $n undefined SSL_* symbol(s) in a non-SSL build" "$(nm -D "$so" | awk '$1=="U" && $2 ~ /^SSL_/')"
     fi
+    # geo.c verifies the location.db signature with OpenSSL libcrypto
+    # (EVP/PEM/ECDSA), UNCONDITIONALLY -- so EVERY variant's .so must carry a
+    # DT_NEEDED libcrypto, else those symbols are undefined at dlopen in an
+    # nginx with no other libcrypto consumer (e.g. --without-http_ssl_module).
+    # NOTE: a shared object keeps libcrypto symbols as 'U' in .dynsym even when
+    # linked with -lcrypto (definitions are NOT copied across .so boundaries);
+    # the fix's observable, assertable effect is the DT_NEEDED entry, NOT the
+    # disappearance of the undefined EVP_*/PEM_* symbols. The old SSL_*-only
+    # undef filter above never saw the geo crypto symbols, so this is the
+    # regression net for the `ngx_module_libs="-lcrypto"` build fix (config).
+    local crypto; crypto=$(readelf -d "$so" 2>/dev/null | grep -c 'NEEDED.*libcrypto')
+    [ "${crypto:-0}" -ge 1 ] \
+        && ok "$label: DT_NEEDED libcrypto present (geo.c EVP/PEM/ECDSA resolvable at dlopen)" \
+        || bad "$label: NO DT_NEEDED libcrypto -- geo.c crypto symbols would be undefined at dlopen in a non-SSL nginx (ngx_module_libs missing -lcrypto?)"
 }
 
 echo "=== WAF build-portability matrix ==="
