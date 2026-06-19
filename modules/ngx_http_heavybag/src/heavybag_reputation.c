@@ -262,10 +262,17 @@ ngx_http_heavybag_country_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *cc)
 ngx_int_t
 ngx_http_heavybag_asn_add(ngx_conf_t *cf, ngx_array_t **arr, ngx_str_t *val)
 {
-    ngx_int_t   n;
+    off_t       n;
     uint32_t   *asn;
 
-    n = ngx_atoi(val->data, val->len);
+    /*
+     * Parse into a 64-bit off_t, NOT ngx_int_t: on a 32-bit (ILP32) build
+     * ngx_atoi overflows at 2^31-1 and would reject legitimate 4-byte ASNs
+     * above ~2.15B (e.g. AS4200000000) before the range check runs. ngx_atoof
+     * is width-independent, so the advertised 1..4294967295 range holds on
+     * every build. (M2)
+     */
+    n = ngx_atoof(val->data, val->len);
 
     /* 4-byte ASN range 1..4294967295; 0 is reserved and fails open anyway */
     if (n == NGX_ERROR || n <= 0 || (uint64_t) n > 0xffffffffULL) {
