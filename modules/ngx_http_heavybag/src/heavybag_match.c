@@ -48,7 +48,22 @@
 
 #include "heavybag_match.h"   /* type shim: u_char/ngx_*_t/ngx_str_t/ngx_conf_t... */
 
+#ifndef HEAVYBAG_MATCH_FORCE_PCRE1
 #define NGX_PCRE2  1
+#else
+/*
+ * PCRE1-arm coverage build (test-only, -DHEAVYBAG_MATCH_FORCE_PCRE1): leave
+ * NGX_PCRE2 undefined so the #else arm of ngx_http_heavybag_regex_exec (and the
+ * PCRE1 HEAVYBAG_RE_NOMATCH_RC) compile -- they are dead in the normal unit
+ * build, which hard-defines NGX_PCRE2. nginx's PCRE1 wrapper returns
+ * NGX_REGEX_NO_MATCHED on a clean no-match; the shim's ngx_regex_exec is
+ * pcre2-backed and returns PCRE2_ERROR_NOMATCH, and
+ * NGX_REGEX_NO_MATCHED == PCRE2_ERROR_NOMATCH == -1 (verified), so define the
+ * constant to that exact rc. This whole arm lives inside the unit shim --
+ * the production -Werror build defines neither test macro and never sees it.
+ */
+#define NGX_REGEX_NO_MATCHED  PCRE2_ERROR_NOMATCH
+#endif
 
 #define NGX_OK          0
 #define NGX_ERROR     (-1)

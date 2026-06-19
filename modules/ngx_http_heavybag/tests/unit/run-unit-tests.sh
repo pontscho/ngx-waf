@@ -140,6 +140,42 @@ else
     echo "reputation unit test COMPILE FAILED"; rc=1
 fi
 
+# ---- scanner/match PCRE1 #else-arm coverage (real pcre2 engine underneath) -
+# Drives the legacy PCRE1 code path of ngx_http_heavybag_regex_exec -- dead in
+# the normal match build, which hard-defines NGX_PCRE2. -DHEAVYBAG_MATCH_FORCE_
+# PCRE1 leaves NGX_PCRE2 undefined so the #else arm + PCRE1 NOMATCH constant
+# compile. ASan+UBSan like the main match suite; needs -lpcre2-8.
+BIN_MATCHP1="$TMP/heavybag-test-match-pcre1"
+if "$CC" -DHEAVYBAG_MATCH_UNIT_TEST -DHEAVYBAG_MATCH_FORCE_PCRE1 $COMMON $COV $SAN \
+        "$DIR/test-match-pcre1.c" -lpcre2-8 -o "$BIN_MATCHP1"; then
+    echo "== scanner/match PCRE1 arm (ASan+UBSan) =="
+    env $SAN_RUN "$BIN_MATCHP1" "$@" || rc=1
+else
+    echo "match PCRE1 unit test COMPILE FAILED"; rc=1
+fi
+
+# ---- rate-limit CAS contention stress (TSan; opt-in HEAVYBAG_TSAN=1) ------
+# Drives the lock-free CAS lose/retry path + bounded-retry starvation fail-open
+# under REAL thread contention -- both unreachable single-threaded, so the
+# plain heavybag_unit gate cannot cover them. TSan cannot combine with ASan and
+# is slow (~4 s), hence opt-in and separate from the fast gate. -O2 only (no
+# $COV: coverage composes with ASan, NOT TSan -- this is its own pass). The one
+# DELIBERATE nginx lock-free-idiom race (optimistic plain read vs __sync CAS in
+# ngx_http_heavybag_rate_check) is suppressed via tsan-rate.supp; every other
+# race + any crash still fails the run.
+if [ "${HEAVYBAG_TSAN:-0}" = "1" ]; then
+    BIN_RATESTRESS="$TMP/heavybag-test-rate-stress"
+    if "$CC" -DHEAVYBAG_RATE_UNIT_TEST $COMMON -fsanitize=thread \
+            -fno-sanitize-recover=all "$DIR/test-rate-stress.c" -lpthread \
+            -o "$BIN_RATESTRESS"; then
+        echo "== rate-limit CAS contention stress (TSan) =="
+        env TSAN_OPTIONS="suppressions=$DIR/tsan-rate.supp halt_on_error=1:abort_on_error=1" \
+            "$BIN_RATESTRESS" "$@" || rc=1
+    else
+        echo "rate-stress (TSan) unit test COMPILE FAILED"; rc=1
+    fi
+fi
+
 # ---- per-suite coverage report (gcov text; lcov HTML if available) -------
 # Each suite is ONE translation unit: test-X.c #includes the production
 # src/heavybag_*.c. gcov on the TU stem reports every contributing source;

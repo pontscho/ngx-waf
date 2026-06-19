@@ -1,0 +1,18 @@
+# ThreadSanitizer suppressions for the lock-free token-bucket stress
+# (test-rate-stress.c). ONE entry, tightly scoped + documented.
+#
+# ngx_http_heavybag_rate_check uses the nginx lock-free idiom: an OPTIMISTIC
+# PLAIN read of the packed slot word (old = s->state; k = cand->key) followed
+# by a __sync compare-and-swap that re-validates `old`. On x86 (and every
+# platform nginx targets) this is correct -- a stale read just loses the CAS
+# and retries -- but the plain read is, strictly, a C11 data race against the
+# atomic write, so TSan reports it. ngx_atomic_t IS that relaxed-read /
+# cmp_set-write word; this is identical to nginx core's own atomics and is the
+# DELIBERATE design, not a bug.
+#
+# Scoping the suppression to this ONE function means TSan still flags any
+# UNINTENDED race anywhere else (the shm header, the slot-array indexing, the
+# per-thread result counters, the clock global) and still aborts on a crash --
+# which is what the stress run actually validates, alongside outcome
+# conservation and slot integrity.
+race:ngx_http_heavybag_rate_check

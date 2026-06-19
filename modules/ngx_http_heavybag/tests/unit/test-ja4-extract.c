@@ -442,6 +442,66 @@ CTEST(ja4x, error_path_frees_ext_ids)
 }
 
 
+/* ===== end-to-end real vector ============================================= *
+ * The FoxIO canonical ClientHello, driven as RAW getter bytes through the
+ * extractor, must reproduce the PUBLISHED JA4. Every other test in this file is
+ * STRUCTURAL (byte offsets / two builds compared); this one pins the FULL
+ * wire-parse -> core pipeline against a real, published fingerprint.
+ *
+ * The component values are the FoxIO reference vector (identical to the arrays
+ * test-ja4.c feeds straight to the build core, expected
+ * t13d1516h2_8daaf6152771_e5627efa2ab1) -- NOT invented. Its cipher hash
+ * 8daaf6152771 is the same JA4_b carried by the Chromium row of
+ * .claude/tmp/ja4plus-mapping.csv (t13d1516h2_8daaf6152771_02713d6af862), i.e.
+ * this canonical hello shares Chrome's cipher list; the JA4_c differs only in
+ * the extension/sigalg set, which the CSV does not carry as raw bytes (and we
+ * refuse to fabricate per-browser ext lists). Here the raw bytes pass through
+ * the cipher 2-byte decode, the supported_versions (0x002b) parse, the
+ * signature_algorithms (0x000d) parse and the ALPN (0x0010) parse before
+ * reaching the core -- so a regression in ANY getter-parse step would change
+ * the published string.
+ * ========================================================================= */
+CTEST(ja4x, foxio_canonical_through_extractor)
+{
+    /* cipher_suites: GREASE 0x5a5a + the 15 real suites, 2-byte big-endian */
+    static const unsigned char  cip[] = {
+        0x5a,0x5a, 0x13,0x01, 0x13,0x02, 0x13,0x03, 0xc0,0x2b, 0xc0,0x2f,
+        0xc0,0x2c, 0xc0,0x30, 0xcc,0xa9, 0xcc,0xa8, 0xc0,0x13, 0xc0,0x14,
+        0x00,0x9c, 0x00,0x9d, 0x00,0x2f, 0x00,0x35
+    };
+    /* extensions present: 2 GREASE + SNI(0x0000) + ALPN(0x0010) + the rest,
+     * incl sigalgs(0x000d) and supported_versions(0x002b) */
+    static int  exts[] = {
+        0xfafa, 0x1a1a, 0x0000, 0x0010, 0x0005, 0x000a, 0x000b, 0x000d,
+        0x0012, 0x0015, 0x0017, 0x001b, 0x0023, 0x002b, 0x002d, 0x0033,
+        0x4469, 0xff01
+    };
+    /* supported_versions (0x002b) body: 1-byte list len, then GREASE + 0x0304
+     * -> the extractor skips GREASE and picks 0x0304 (TLS 1.3) */
+    static const unsigned char  sv[] = { 0x04, 0x5a,0x5a, 0x03,0x04 };
+    /* signature_algorithms (0x000d) body: 2-byte list len (16), then 8 entries
+     * in ORIGINAL order (JA4 keeps sigalg order) */
+    static const unsigned char  sa[] = {
+        0x00,0x10, 0x04,0x03, 0x08,0x04, 0x04,0x01, 0x05,0x03,
+        0x08,0x05, 0x05,0x01, 0x08,0x06, 0x06,0x01
+    };
+    /* ALPN (0x0010) body: 2-byte list len (3), 1-byte proto len (2), "h2" */
+    static const unsigned char  al[] = { 0x00,0x03, 0x02, 'h','2' };
+    char  j[64];
+
+    INIT_SSL(s);                         /* legacy_version 0x0303 */
+    s.ciphers = cip;  s.ciphers_len = sizeof(cip);
+    s.exts = exts;    s.exts_n = sizeof(exts) / sizeof(exts[0]);
+    s.ext[0].type = 0x002b; s.ext[0].data = sv; s.ext[0].len = sizeof(sv);
+    s.ext[1].type = 0x000d; s.ext[1].data = sa; s.ext[1].len = sizeof(sa);
+    s.ext[2].type = 0x0010; s.ext[2].data = al; s.ext[2].len = sizeof(al);
+    s.next_ext = 3;
+
+    ASSERT_EQUAL(36, run_ja4(&s, j));
+    ASSERT_STR("t13d1516h2_8daaf6152771_e5627efa2ab1", j);
+}
+
+
 int
 main(int argc, const char *argv[])
 {
