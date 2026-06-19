@@ -27,7 +27,7 @@
 
 set -u
 
-ROOT=/mnt/nvme/imaginarium/openresty
+ROOT=${HEAVYBAG_ROOT:-/mnt/nvme/imaginarium/openresty}
 CORPUS=$ROOT/modules/ngx_http_heavybag/tests/corpus
 TOOLS=$ROOT/modules/ngx_http_heavybag/tools
 SRC=$ROOT/reference/geolookup.c

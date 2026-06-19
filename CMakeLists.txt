@@ -151,3 +151,12 @@ add_custom_target(heavybag_module
           ${NGINX_SRC_DIR}/objs/ngx_http_heavybag_module.so
           ${SANDBOX_DIR}/modules/ngx_http_heavybag_module.so
   COMMENT "Rebuilding ngx_http_heavybag_module.so and copying into sandbox/modules/")
+
+# ============================================================================
+# Test harnesses — registered as CTest tests (portable launcher around the
+# committed tests/run-*.sh harnesses). See cmake/Tests.cmake for the full usage.
+#   cmake --build build -j        # build the sandbox first
+#   ctest --test-dir build        # then run the suite  (or: --target check)
+# ============================================================================
+enable_testing()
+include(${CMAKE_SOURCE_DIR}/cmake/Tests.cmake)

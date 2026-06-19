@@ -549,3 +549,150 @@ New `tests/unit/test-match.c` (suite `match`); runner stanza added with `-lpcre2
 **Verification:** `run-unit-tests.sh` exit 0 — **match 15/15** (new suite), JA4 24/24, UA 57/57, rate 16/16, geo 20/20 (regressions clean). The production header+`.c` got `#ifndef` isolation guards → verified byte-transparent: **inspector PASS** (p:minion-impl-inspector — git diff against HEAD is 100% additive, ZERO deletions/modified statements; the `#if (NGX_PCRE2)` ReDoS helper sits ABOVE every unit guard = shared production code, byte-identical between builds; 15/15 CORRECT, no tautology incl. the real-engine ReDoS vector, scope-honesty confirmed). SSL `objs/` rebuild clean `-Werror` (zero warnings, all 12 objs incl. `heavybag_match.o` + every includer TU compile silently, OpenSSL NOT rebuilt), md5 build==deploy `4098d087c1b1b88873d0d5ac2494ce67`, `nginx -t` binary-compatible. The `.so` md5 changed from Phase 2-4's `c1ddfa3b…` to `4098d087…` due only to DWARF `__LINE__`/debug-info shift from the added `#ifndef` lines — the production preprocessed token stream is unchanged (guards take the nginx branch in the no-`-D` build). Build+test+inspect via minions.
 
 **Not committed:** partner commits source+tests on main + pushes himself.
+
+### Phase 6 — protocol-lifecycle + decode/cookie integration + ja4 extractor unit (48 vectors) — COMPLETED 2026-06-18
+
+The live-fire phase. Where Phases 1-5 froze the pure-core contracts as standalone unit tests, Phase 6 drives the request-lifecycle paths that only exist with a real `ngx_http_request_t` / TLS handshake, plus the ja4 *extractor* clamps that a live OpenSSL handshake cannot reach. Three sub-phases, two new permanent harnesses:
+
+- **6a/6b — `tests/heavybag-protocol-test.conf` + `tests/run-protocol-tests.sh`** (new committed integration harness, honeypot-regression style: self-contained 285xx ports, zero-proxy_pass invariant asserted, 127.0.0.1-only, `waf_reason_header on`, `waf_status` scrape). **32/32 assertions PASS** against the live sandbox nginx.
+- **6c — `tests/unit/test-ja4-extract.c`** (new committed unit, mocks the 5 `SSL_client_hello_*` getters + `SSL_is_quic` and drives `ngx_http_heavybag_ja4_compute` directly). **16/16 PASS**; unit suite now **148** (JA4 24 + **ja4x 16** + UA 57 + rate 16 + geo 20 + match 15).
+
+Partner decisions (2026-06-18, AskUserQuestion): permanent committed `tests/` harness (not throwaway `.claude/tmp/reverify`); 6c as a unit-mock extractor (not a brittle live raw-socket TLS client, since the malformed-inner-length / odd-byte clamps abort the OpenSSL handshake before the JA4 is observable on the wire).
+
+#### Part A — protocol-lifecycle (11 assertions, live nginx)
+
+| # | Vector | Setup | Observed |
+|---|---|---|---|
+| A1 | keepalive fresh ctx (both orders) | one keepalive conn, blocked-then-clean + clean-then-blocked | `/wp-login.php`=404 then `/index.html`=200; `/index.html`=200 then `/phpmyadmin/`=403 — per-request verdict independent, no ctx poisoning across reuse |
+| A2 | keepalive TLS JA4 stable | 2 requests, one TLS conn | identical `$waf_ja4_hash` (`t13i3112h1_…`) on both |
+| A3 | H2 multiplex | `curl --http2`, two URLs one conn | shared connection JA4 (`t13i3112h2_…`) + per-stream verdict (200 / 404) |
+| A4 | internal-redirect count-once | 404 → `error_page` → `/index.html` | `http_requests_total` +1 (NOT +2), `http_allowed` +1 — confirms the observability-02 fix (`r->internal` gate) as a permanent net |
+| A5 | SSI subrequest never re-scanned | SSI page `#include`s a scanner path | direct hit `blocked_scanner_path` +1, SSI-include subrequest +0 — `r != r->main` bail proven live |
+| A7 | plaintext JA4 no-op | non-TLS listener, `add_header X-JA4 [$waf_ja4_hash]` | `X-JA4: []` (empty) + 200, no NULL deref / crash |
+| A8 | TLS resumption | `openssl s_client -sess_out`/`-sess_in` | full JA4 `t13i310900_…`, resumed JA4 `t13i311000_…` — **FINDING:** resumption does NOT degrade to no-JA4 (the client_hello callback fires on the resumption ClientHello too), it yields a DIFFERENT JA4 (the resumption hello carries extra PSK/early-data extensions → different ext count). No crash, no NULL deref. This refines the Discovery `ja4flow-04` assumption ("resumption → no JA4") to "resumption → a distinct JA4, computed safely". |
+| A9 | XFF client IP honoured | `waf_trusted_proxy` + blocklisted XFF | blocklisted XFF=403 (reason=blocklist), benign XFF=200 — client IP derived from XFF across the request (the observable core of lifecycle-09 redirect client_sa re-derivation) |
+| A10 | spoof body-filter emits once | controlled runtime ja4.list maps live JA4 → tool; UA=Chrome | enforce → 403 `X-Spoof:1`, body emitted once (Content-Length 275 == bytes received); control UA=curl (tool family) → 200 `X-Spoof:0` (no false positive) |
+| A12 | mail auth_http (no ctx/JA4) | `waf_mail_auth` content handler, Client-IP header | blocklisted Client-IP → `Auth-Status: static blocklist`; benign → `Auth-Status: OK` — reputation runs over plain HTTP with no request ctx / no TLS / no JA4 |
+| A13 | log-phase lazy ctx | `waf off` vhost, `$waf_*` in `log_format` | 200 + `type=regular spoof=0` logged, no crash — the var getters lazily resolve ctx at LOG phase when PREACCESS was skipped |
+
+**Not exercised (honest out-of-scope, documented in the runner header):** H3/QUIC transport — the system curl (7.81) has no HTTP/3 client; the QUIC JA4 path shares `ngx_http_heavybag_ja4_compute` with the TLS path (A2/A3 + the 6c extractor unit cover the fingerprint logic), so only the transport is unverified, not the WAF logic. HTTP/1.1 pipelining was folded into the keepalive ctx-isolation assertion (A1) since curl will not emit a pipelined burst.
+
+#### Part B — module.c percent-decode + Cookie ngx_list walk (14 assertions)
+
+Controlled probe lists (`corpus/protocol-args.list`: `union`→403, `'union`→404; `corpus/protocol-cookie.list`: `sqlmap`→404, `^evilcookie$`→403) make each `ngx_unescape_uri(type=0)` + `ngx_http_heavybag_sig_lookup_decoded`/`_sig_cookie_lookup` edge map to an unambiguous verdict. All assertions match the **real** `ngx_unescape_uri` semantics (traced from the nginx source, `type=0`): `%2g` → all 3 bytes deleted; `%00` → a literal NUL byte emitted (no truncation); a bare trailing `%` → dropped; `%%%%` → contracts to `%%`.
+
+| # | Vector | Verdict | Proves |
+|---|---|---|---|
+| B1 | `%75nion` → `union` | 403 | basic single decode |
+| B2 | `uni%2gon` → `union` | 403 | `%2g` 3-byte delete bridges "uni"+"on" |
+| B3a | `%27union` → `'union` | 404 | single decode produces the literal quote |
+| B3b | `%2527union` → `%27union` | 403 (via `union`, NOT 404) | **single-pass contract**: the quote stays `%27`-encoded, so the `'union`(404) pattern never fires — only `union`(403) does |
+| B4a | `un%00ion` → `un\0ion` | 200 | NUL breaks the token (no `union` match) |
+| B4b | `safe%00union` → `safe\0union` | 403 | **NO truncation bypass**: bytes after the NUL are still scanned (length-driven), `union` matches |
+| B5 | `union%` → `union` | 403 | bare trailing `%` dropped |
+| B6 | `%%%%` → `%%` | 200 | all-`%` contraction, no crash |
+| B7 | no query | 200 | empty-args short-circuit (`raw->len==0` → DECLINED, no decode alloc) |
+| B8a | `Cookie: a=sqlmap` | 404 | whole-value substring match |
+| B8b | `Cookie: a=evilcookie` vs `^evilcookie$` | 200 | **no `;`/`=` pair-walk**: the whole value (`a=evilcookie`) cannot satisfy the anchored pattern |
+| B8c | `Cookie: evilcookie` | 403 | anchored whole-value match (control for B8b) |
+| B9 | `Cookie: clean=1` + `Cookie: junk=sqlmap` | 404 | multi-Cookie `ngx_list` walk reaches the 2nd header |
+| B10 | `Cookie;` (empty) | 200 | empty-cookie short-circuit |
+
++ 2 reason-attribution spot-checks (`X-WAF-Reason: args` / `cookie`) and an error-log scan (clean: no crash/alert/emerg/alloc-fail).
+
+#### Part C — ja4 extractor unit-mock (16 vectors, `test-ja4-extract.c`)
+
+Isolation: a byte-mirroring nginx type shim + mock `SSL_client_hello_*` getters, then `#include heavybag_ja4.c` under `-DHEAVYBAG_JA4_EXTRACT_UNIT_TEST`. That macro makes `heavybag_ja4.{h,c}` SKIP their `<ngx_config.h>`/`<ngx_core.h>`/`<openssl/ssl.h>` includes (the test supplies the types + getters) while still pulling in the real pure core (real `<openssl/evp.h>` for SHA256, `-lcrypto`) and the real extractor `ngx_http_heavybag_ja4_compute`. Two tiny `#ifndef HEAVYBAG_JA4_EXTRACT_UNIT_TEST` guards added to production (`.h` + `.c`) — production defines NEITHER test macro → byte-transparent. Assertions are STRUCTURAL (fixed byte offsets in the 36-char JA4 string, or two builds compared) — no hand-computed SHA literal.
+
+| # | Test | Clamp / behaviour exercised |
+|---|---|---|
+| 1 | `cipher_two_byte_parse` | 2-byte BE cipher decode → count `02` |
+| 2 | `cipher_odd_trailing_byte_dropped` | `i+1<len` drops the dangling half-cipher → count `01` |
+| 3 | `cipher_count_over_max_clamps` | 300 ciphers → `n_cip` clamps to `HEAVYBAG_JA4_MAX_ELEMS`, count field `99`, no over-read |
+| 4 | `supported_versions_inner_length_lie_clamped` | ext 0x002b `list=255` vs body 3 → `end=len` clamp, the one real version (TLS1.3) parsed |
+| 5 | `supported_versions_short_body_falls_back` | too-short body → no full entry → legacy version |
+| 6 | `sigalgs_inner_length_lie_clamped` | ext 0x000d `list=255` clamped → 1 sigalg still feeds JA4_c (differs from no-sigalgs build) |
+| 7 | `sigalgs_odd_trailing_byte_dropped` | trailing odd byte dropped (`i+1<end`) → JA4_c equals the clean-list build |
+| 8 | `alpn_exact_fit` | `3+list==len` → ALPN `h2` |
+| 9 | `alpn_zero_len_is_00` | `list==0` guard → no ALPN → `00` |
+| 10 | `alpn_lying_length_rejected` | `3+list>len` → ALPN rejected entirely → `00`, no over-read |
+| 11 | `alpn_embedded_nul_length_driven` | proto `{h,NUL,2}` length 3 → field `h2` (first/last byte, length-driven, not strlen-cut at NUL) |
+| 12 | `sni_presence_byte` | ext 0x0000 present → byte[3]=`d`; absent → `i` |
+| 13 | `ext_count_field` | 4 ext ids → count `04` |
+| 14 | `is_quic_proto_char` | `SSL_is_quic` → proto byte `q` vs `t` |
+| 15 | `ext_ids_freed` | the allocating getter's buffer is `OPENSSL_free`d on success (CWE-401) |
+| 16 | `null_out_is_error` | NULL `out` (with non-NULL ssl+pool) → `NGX_ERROR`, no write |
+
+**Honest out-of-unit-scope:** the live H3/QUIC transport (no client); the `client_hello` callback + `SSL_CTX` wiring (in module.c, not this TU). The wire-level inner-length-lie / odd-byte vectors are unreachable through a live handshake (OpenSSL aborts before the JA4 is observable) — which is exactly why they are driven here through mocked getters.
+
+**Verification:** `run-protocol-tests.sh` 32/32 + `run-unit-tests.sh` 148/148, both exit 0. The two production guard edits are byte-transparent: SSL `objs/` rebuild clean `-Werror` (zero warnings, OpenSSL NOT rebuilt), `nginx -t` binary-compatible; deployed `.so` md5 `4098d087…` → `03a216df17d1661854e8287045050eb8` (DWARF `__LINE__` shift only; production token stream unchanged — the protocol harness re-ran 32/32 against the rebuilt `.so`, behavioral byte-transparency confirmed). Build via p:minion-builder; integration + unit runs inline (runtime harness against the built `.so`, the reverify pattern). New committed files: `tests/heavybag-protocol-test.conf`, `tests/run-protocol-tests.sh`, `tests/corpus/protocol-args.list`, `tests/corpus/protocol-cookie.list`, `tests/unit/test-ja4-extract.c`; edited: `tests/unit/run-unit-tests.sh` (+1 stanza), `src/heavybag_ja4.{h,c}` (2 byte-transparent guards).
+
+**Not committed:** partner commits source+tests on main + pushes himself.
+
+### Phase 7 — config-build layer: nginx -t validation + build matrix + startup/reload (64 vectors) — COMPLETED 2026-06-19
+
+The last backlog category. Where Phases 1-6 froze the pure-core contracts (unit) and the request-lifecycle paths (integration), Phase 7 closes the **config-build** dimension: the merge-time / parse-time fail-closed decisions that only exist with the real nginx config machinery, the build-portability surface across the supported `./configure` permutations, and the two runtime vectors that only manifest in a live master/worker cycle. Partner decision (2026-06-19, AskUserQuestion): **full permutation matrix** (not just the 3 shipped-fix trees) + **reload + stream-startup runtime** (not nginx -t + build only). **Three new committed harnesses, ZERO production source touched** (test-only phase — deployed SSL `.so` md5 `03a216df17d1661854e8287045050eb8` unchanged from Phase 6, build==deploy, byte-transparent by construction). No inspector required (mirrors the Phase 3 test-file-only precedent).
+
+**Scope split established:** the WF-3 "config-build (28)" backlog has a LIST-PARSE half already frozen byte-for-byte by the Phase 5 `match.c` unit (next_line CRLF/no-newline/blank-skip, empty->NULL bucket, inline-comment, unknown-action EMERG). Phase 7 adds the two layers a unit cannot reach — `nginx -t` integration of those same decisions PLUS the merge/build/runtime-only vectors.
+
+#### Part A — config-validation `nginx -t` net (`tests/run-config-tests.sh`, 34 assertions)
+
+Each vector generates a minimal self-contained conf and runs `nginx -t`, asserting accept / reject-with-specific-diagnostic / accept+WARN. A reject for the WRONG reason (e.g. a missing stream handler) FAILS the assertion because the grep targets the exact `ngx_conf_log_error` string. `nginx -t` does not bind sockets, so the loopback ports never conflict and nothing egresses. **34/34 PASS.**
+
+| Vector(s) | What it pins |
+|---|---|
+| V1-V4 | `waf_geo_block`/`waf_asn_block`/`waf_geo_whitelist` without `waf_geo_db` -> EMERG `require waf_geo_db` (HTTP **and** STREAM heads — both fail-closed) |
+| V5 | geo policy WITH the valid signed `geodb/location.db` -> accept (real ECDSA-P521 verify in -t) |
+| V6 vs V7 | the rate-zone asymmetry: HTTP `waf_rate_limit` with no zone -> **EMERG reject**; STREAM `waf_stream_rate_limit` with no zone -> **accepts + WARN** `stream rate limiting is DISABLED` (sharedmem-03/config-02, init_module WARN landing in the error_log during -t) |
+| V8 | `waf_rate_zone size=4k` (< 8 pages) -> EMERG `too-small size`; V9 size=1m -> accept |
+| V10-V15 | rate_rule_add guards: `rate=0` (invalid rate count), `r/d` (invalid rate unit), `1e12 r/s` (rate is too large), missing `rate=` (requires a rate=), `>1 default rule`, `burst=0` (invalid burst) |
+| V16-V18 | `for_geo=CN,US` accept; **trailing comma `CN,` accepts** (skip-comma exits the loop, no empty token — matches the WF-3 "trailing-comma OK" seed); **double comma `CN,,US` rejects** (`two letters`) |
+| V19-V22 | unknown `waf_verified_bot` class; unknown `waf_flag_block` token; duplicate `waf_scanner_list`; duplicate `waf_rate_zone` |
+| V23-V28 | list-parse @ integration: ja4.list malformed line -> accept+WARN-skip; invalid regex -> abort; missing file -> abort (`open() ... failed`); unknown action -> EMERG (round-2); inline-comment-after-action -> accept (round-2); **100KB single line -> bounded `pcre2 too large` reject, no OOM/hang** (graceful fail-closed) |
+| V29-V32 | `waf_mail_backend` hostname rejected (numeric IP only), out-of-range port rejected, valid IP+port accepted; corrupt/unsigned geo_db rejected (fail-closed verify) |
+| V33 | kitchen-sink: every major directive in one valid config -> accept (proves the harness is not merely rejecting everything) |
+
+#### Part B — build-portability matrix (`tests/run-build-matrix.sh`, 20 assertions)
+
+Module-only rebuild (`make -f <tree>/Makefile modules` — no `./configure` rerun, no OpenSSL-rebuild trap) across the supported permutation trees + `nm -D` symbol assertions. Self-bootstraps a missing builddir tree via `./configure --builddir` + the ssl.h touch-guard; the 3 CORE trees are required. **20/20 PASS** — and crucially **NO new build defect surfaced** (unlike Fix-round-1 which caught `ja4ssl-build-001` via the permutation test). The three shipped build fixes hold across the whole matrix:
+
+| Permutation | Result | Symbol assertion |
+|---|---|---|
+| `objs` (SSL+stream+v2+v3+mail, canonical) | build clean, 0 warn | http+stream modules both exported |
+| `objs-nossl` (`--without-http_ssl_module`) | build clean, 0 warn | **0 undefined `SSL_*` symbols** (config-01 + ja4ssl-build-001 hold) |
+| `objs-nostream` (`--without-stream`) | build clean, 0 warn | `ngx_stream_heavybag_module` **absent** (config-build-001 holds) |
+| `objs-nov2` (`--without http_v2`) | build clean, 0 warn | both modules exported (no v2 coupling) |
+| `objs-nov3` (`--without http_v3`) | build clean, 0 warn | both modules exported (no v3 coupling) |
+| `objs-mail` (+mail; canonical already enables it) | build clean, 0 warn | both modules exported (zero mail interference; .so 8 bytes = alignment padding vs canonical) |
+| `objs-nopcre` (`--without-pcre`) | **expected nginx configure ABORT** | n/a — nginx's built-in `http_rewrite` module hard-requires PCRE; a clean `requires the PCRE library` diagnostic at configure time, BEFORE any heavybag source is reached. Not a heavybag portability defect; asserted as the expected failure mode. |
+
+#### Part C — startup/reload runtime net (`tests/run-runtime-tests.sh` + 2 confs, 10 assertions)
+
+Live master/worker cycle (binds 127.0.0.1 286xx). **10/10 PASS.**
+
+| # | Vector | Setup | Observed |
+|---|---|---|---|
+| C1 | **stream-only startup (sharedmem-01)** | HTTP-less config (`stream{}` only, `waf_stream on` + `waf_blocklist`, proxy to a closed loopback port) | passes `nginx -t`; master **starts clean** (no size-0 `waf_status` fatal abort); a loopback connection exercises the NULL-resolved stream stat path with no crash; error log clean |
+| C2 | **reload-storm (shm reuse by layout signature)** | http{} `waf_rate_zone` + `waf_status` + scanner list, stream{} `waf_stream_rate_limit` sharing the same `waf_rate` zone; warm counters then 10× SIGHUP reload | all 10 reloads accepted; master pid **stable** across the storm + alive; counters **persisted + accumulated** `http_requests_total 8 -> 18` (== R0+10, shm reused not reset; a reallocated zone would read ~10 and fail the `>= R0+8` threshold); scanner rule still enforced post-reload (`/phpmyadmin/ -> 403`); error log clean (no `not binary compatible`, no emerg, no crash) |
+
+**Verification:** all three harnesses green against the live sandbox nginx (`run-config-tests.sh` 34/34, `run-build-matrix.sh` 20/20, `run-runtime-tests.sh` 10/10 — 64 assertions total, all exit 0). Deployed SSL `.so` md5 `03a216df17d1661854e8287045050eb8` **unchanged from Phase 6** (no production source edited; build==deploy; `nginx -t` binary-compatible). New committed files: `tests/run-config-tests.sh`, `tests/run-build-matrix.sh`, `tests/run-runtime-tests.sh`, `tests/heavybag-runtime-streamonly.conf`, `tests/heavybag-runtime-reload.conf`. Generated corpus (`tests/corpus/.config-tmp/`) is scratch (gitignore-able). No edits to any `src/*.c`/`*.h` or `tests/unit/`.
+
+**Out of scope (documented):** a fully no-PCRE deployment (would need `--without-http_rewrite_module` too — an unrealistic target with no location regex); the critic's un-probed deep-fuzz surfaces (authhttp SMTP path, spoof self-swap, reputation verdict precedence, stat_cc table saturation) remain a separate optional round.
+
+**Not committed:** partner commits source+tests on main + pushes himself.
+
+---
+
+## Campaign status (2026-06-19)
+
+**Discovery (WF-1/2/3) + 3 fix rounds + 7 test-matrix phases COMPLETE.** The full 142-vector backlog is now a permanent regression net across all three layers:
+
+- **Unit** (`tests/unit/`, 148 cases): rate 16, geo 20, ua 57, ja4-core 24, ja4-extract 16, match 15.
+- **Integration** (`tests/run-*.sh`): protocol-lifecycle + decode/cookie (32), config-validation `nginx -t` (34), startup/reload runtime (10).
+- **Build** (`tests/run-build-matrix.sh`, 20): the full `./configure` permutation surface, 3 shipped build-fixes netted.
+
+**Portable runner (2026-06-19):** all harnesses are registered as CTest tests via `cmake/Tests.cmake` (included from the top `CMakeLists.txt` after `enable_testing()`). The bash harness stays the source of truth; CTest is the portable launcher. After a normal build: `ctest --test-dir build` (or `cmake --build build --target check`); filter with `ctest -L unit|integration|build` / `ctest -R config`. nginx-bound tests share a `RESOURCE_LOCK heavybag_sandbox` (never run concurrently under `ctest -j`); a harness that exits 2 (sandbox not built) is reported SKIPPED via `SKIP_RETURN_CODE 2`. Registered (10): heavybag_{unit,build_matrix,config,protocol,stat,regression,runtime,replay,honeypot,oracle_build}. `heavybag_replay` asserts the false-positive gate (its main coverage sweep is capped via `ENV "LIMIT=200"`); `heavybag_honeypot` is the read-only ASN/geo analysis pipeline (label `analysis`) and SKIPs cleanly via `SKIP_RETURN_CODE 2` when the raw access log / geo db are absent on the host. `heavybag_oracle_build` (label `build`, `tests/run-oracle-build.sh`) is a build smoke that compiles the four `reference/*.c` developer oracles (geolookup/loctest/nanolibloc libc-only; locverify against the in-tree OpenSSL) so they cannot rot silently — it asserts no behaviour. With this, EVERY runnable script under `tests/` is wired into CTest; only the `tools/*` data/fixture regenerators (which mutate committed corpora) remain intentionally hand-run.
+
+**Relocatable harnesses (2026-06-19):** every `run-*.sh` reads its repo root from `ROOT=${HEAVYBAG_ROOT:-/mnt/nvme/imaginarium/openresty}`, and CTest injects `HEAVYBAG_ROOT=${CMAKE_SOURCE_DIR}` (the `ENVIRONMENT` test property), so a moved/renamed checkout works with no edits. The committed `.conf` files (which bake absolute paths nginx cannot env-substitute) are rendered through `sed s#<default-root>#$ROOT#` into `tests/corpus/.render/` before nginx loads them (a no-op on the default root); the runtime-generated confs already build from `$ROOT`/`$SBX` vars. Proven end-to-end: a `/tmp/hb-relocated -> repo` symlink + `HEAVYBAG_ROOT=/tmp/hb-relocated` ran config 34/34 + runtime 10/10 with the rendered conf carrying the relocated `load_module /tmp/hb-relocated/...` path.
+
+Verdict unchanged from Discovery: **zero attacker-triggerable memory-corruption, crash, or security bypass.** Every issue the campaign found was build-portability, operator-config footgun, accounting honesty, or the one feature gap (JA4-vs-UA spoof enforcement) — all addressed in the three fix rounds and now permanently guarded by tests.
