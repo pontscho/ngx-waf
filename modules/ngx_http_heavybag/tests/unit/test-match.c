@@ -264,27 +264,75 @@ CTEST(match, alternation_second_pattern_matches)
 
 CTEST(match, redos_failopen_bounded)
 {
-    /* The round-2 fix: ngx_http_heavybag_regex_exec runs pcre2_match() with an
-     * explicit match/depth limit. The catastrophic-backtracking pattern
-     * "(a+)+$" against 40 'a's + 'X' (no possible end-anchor match) would take
-     * ~2^40 steps under a default context; the match-limit trips MATCHLIMIT ->
-     * negative -> a no-match (security fail-open), CPU bounded. We assert the
-     * OUTCOME the limit guarantees (no-match, and the test TERMINATES); the
-     * 0.020s timing proof is the runtime layer's (Fix-round-2). */
-    ngx_regex_t  *re[HEAVYBAG_ACTION_MAX] = { 0 };
-    ngx_str_t     subj;
-    u_char        evil[64];
+    /*
+     * The round-2 fix: ngx_http_heavybag_regex_exec runs pcre2_match() with an
+     * EXPLICIT module match/depth limit (HEAVYBAG_PCRE2_MATCH_LIMIT=100000,
+     * _DEPTH_LIMIT=1000), far below PCRE2's built-in 10,000,000 default match
+     * limit. The pattern is NOT JIT-compiled (the shim's ngx_regex_compile
+     * calls only pcre2_compile), so pcre2_match() uses the interpreter and the
+     * match/depth limits are honoured. Two things are asserted:
+     *
+     *  (1) terminal fail-open smoke: a heavily catastrophic input (40 'a's)
+     *      yields a negative rc (no-match class) and the full lookup fails open
+     *      to DECLINED -- no false block, CPU bounded, the test TERMINATES.
+     *
+     *  (2) LOAD-BEARING discrimination: a subject tuned so its backtracking
+     *      cost sits BETWEEN the module's 100k limit and PCRE2's 10M default.
+     *      A DEFAULT match context (mctx=NULL) completes the backtracking and
+     *      returns EXACTLY PCRE2_ERROR_NOMATCH (-1) -- proving the input is
+     *      under both the default match AND depth budget -- while the MODULE
+     *      context trips MATCHLIMIT or DEPTHLIMIT (never NOMATCH) on the SAME
+     *      input. If pcre2_set_match_limit/_depth_limit were removed or
+     *      inflated, the module context would also return NOMATCH and assert
+     *      (2) would FAIL. That is what makes this test guard the fix instead
+     *      of being a tautology: the 10M default alone already trips at 40 'a's,
+     *      so a `rc < 0` check proves nothing about the module's tighter bound.
+     */
+    ngx_regex_t       *re[HEAVYBAG_ACTION_MAX] = { 0 };
+    ngx_str_t          subj;
+    u_char             evil[64];
+    pcre2_match_data  *dmd;
+    int                default_rc, module_rc;
+    /* N tuned so the (a+)+$ backtracking cost on N 'a's + 'X' lands strictly
+     * between the module's 100k and PCRE2's 10M match budget. Verified by the
+     * control assert below: at this N the default context returns exactly -1. */
+    const size_t       N = 21;
 
     ASSERT_EQUAL(NGX_OK, compile("(a+)+$ 403\n", re));
 
+    /* (1) terminal fail-open smoke: deeply catastrophic, trips the module limit */
     memset(evil, 'a', 40);
     evil[40] = 'X';
     subj.data = evil;
     subj.len = 41;
-    /* direct helper: catastrophic input yields a negative rc (no-match class) */
     ASSERT_TRUE(ngx_http_heavybag_regex_exec(re[HEAVYBAG_ACTION_403], &subj) < 0);
     /* full lookup path fails open to DECLINED (no false block from a blown limit) */
     ASSERT_EQUAL(NGX_DECLINED, ngx_http_heavybag_scanner_lookup(re, &subj));
+
+    /* (2) discrimination vector: N 'a's + 'X' (cost between 100k and 10M) */
+    memset(evil, 'a', N);
+    evil[N] = 'X';
+    subj.data = evil;
+    subj.len = N + 1;
+
+    /* control: a DEFAULT context (no module limit) completes the backtracking
+     * and returns EXACTLY NOMATCH (-1). If N were too large the control would
+     * itself trip a limit (rc != -1) and the discrimination below would be
+     * meaningless -- so this assert pins N under the PCRE2 default budget. */
+    dmd = pcre2_match_data_create(1, NULL);
+    ASSERT_NOT_NULL(dmd);
+    default_rc = pcre2_match((pcre2_code *) re[HEAVYBAG_ACTION_403],
+                             subj.data, subj.len, 0, 0, dmd, NULL /* default ctx */);
+    pcre2_match_data_free(dmd);
+    ASSERT_EQUAL(PCRE2_ERROR_NOMATCH, default_rc);   /* exactly -1, not just < 0 */
+
+    /* load-bearing: the MODULE context's tighter limit trips on the SAME input.
+     * (a+)+ may hit the 1000 depth limit before the 100k match limit, so accept
+     * either MATCHLIMIT or DEPTHLIMIT -- both are distinct from NOMATCH and both
+     * mean "the module bounded the backtracking the default context did not". */
+    module_rc = (int) ngx_http_heavybag_regex_exec(re[HEAVYBAG_ACTION_403], &subj);
+    ASSERT_TRUE(module_rc == PCRE2_ERROR_MATCHLIMIT
+                || module_rc == PCRE2_ERROR_DEPTHLIMIT);
 
     /* positive control: the limit never clips a genuine match */
     ASSERT_EQUAL(NGX_HTTP_FORBIDDEN, lookup(re, "aaaa"));
