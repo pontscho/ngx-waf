@@ -178,7 +178,18 @@ ngx_http_heavybag_authhttp_peer_trusted(ngx_connection_t *c)
 #if (NGX_HAVE_INET6)
     case AF_INET6:
         sin6 = (struct sockaddr_in6 *) c->sockaddr;
-        return IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) ? 1 : 0;
+        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) {
+            return 1;                       /* ::1 */
+        }
+        /* On a dual-stack (ipv6only=off) listener the loopback mail proxy
+         * arrives as ::ffff:127.0.0.1, not ::1. Trust the v4-mapped loopback
+         * /8 too, mirroring the rate keyer's v4-mapped handling (heavybag_rate
+         * .c). Without this the loopback peer is judged untrusted and the
+         * Client-IP it sets is dropped. */
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            return sin6->sin6_addr.s6_addr[12] == 127;   /* ::ffff:127.0.0.0/8 */
+        }
+        return 0;
 #endif
     }
 
