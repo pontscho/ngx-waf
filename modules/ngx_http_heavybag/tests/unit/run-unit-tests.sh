@@ -27,22 +27,44 @@ TMP="${TMPDIR:-/tmp}"
 # does not recognise; it is harmless test-harness noise, not our code.
 COMMON="-I$SRC -O2 -Wall -Wno-attributes"
 
+# Sanitizer flags for the memory-sensitive parsers (ja4 wire-walk + scanner).
+# These TUs do bounds/pointer arithmetic over attacker-controlled lengths; -O2
+# alone makes an OOB read/write on the small static globals silent. ASan+UBSan
+# turn a single off-by-one into a hard, halting failure (CWE-125/787). Kept off
+# the other binaries so the cheap pure-core suites stay fast.
+# --param asan-globals=0 + -fno-sanitize=object-size,pointer-overflow: the
+# vendored ctest.h registers tests as globals in a custom linker section and
+# ENUMERATES them by walking pointer+/-1 across object boundaries reading a
+# magic field (ctest.h ~584-597). That deliberate cross-object walk trips ASan's
+# global redzones AND UBSan's object-size/pointer-overflow checks -- a harness
+# false positive, NOT a heavybag bug (ctest.h tags the section no_sanitize but
+# GCC ignores that attribute on variables). Disabling JUST global redzones +
+# those two UBSan sub-checks silences the walk while keeping the detections that
+# matter here: ASan STACK overflow (the extractor's ciphers/sigalgs/exts[256] +
+# buf[37] locals) and HEAP overflow (the malloc'd odd-end sigalgs vector), plus
+# all other UBSan checks (shift/signed-overflow/alignment/...).
+SAN="-fsanitize=address,undefined -fno-sanitize-recover=all --param asan-globals=0 -fno-sanitize=object-size,pointer-overflow"
+# The unit shims deliberately leak (malloc-backed arena / JA4 result buffers are
+# never freed -- the process is short-lived). That is by design, NOT a leak bug,
+# so LeakSanitizer is disabled for the run; ASan/UBSan still catch OOB and UB.
+SAN_RUN="ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+
 rc=0
 
 # ---- JA4 core -------------------------------------------------------------
 BIN_JA4="$TMP/heavybag-test-ja4"
-if "$CC" -DHEAVYBAG_JA4_UNIT_TEST $COMMON "$DIR/test-ja4.c" -lcrypto -o "$BIN_JA4"; then
-    echo "== JA4 core =="
-    "$BIN_JA4" "$@" || rc=1
+if "$CC" -DHEAVYBAG_JA4_UNIT_TEST $COMMON $SAN "$DIR/test-ja4.c" -lcrypto -o "$BIN_JA4"; then
+    echo "== JA4 core (ASan+UBSan) =="
+    env $SAN_RUN "$BIN_JA4" "$@" || rc=1
 else
     echo "JA4 unit test COMPILE FAILED"; rc=1
 fi
 
 # ---- JA4 SSL extractor (mocked getters, real core) -----------------------
 BIN_JA4X="$TMP/heavybag-test-ja4-extract"
-if "$CC" -DHEAVYBAG_JA4_EXTRACT_UNIT_TEST $COMMON "$DIR/test-ja4-extract.c" -lcrypto -o "$BIN_JA4X"; then
-    echo "== JA4 SSL extractor =="
-    "$BIN_JA4X" "$@" || rc=1
+if "$CC" -DHEAVYBAG_JA4_EXTRACT_UNIT_TEST $COMMON $SAN "$DIR/test-ja4-extract.c" -lcrypto -o "$BIN_JA4X"; then
+    echo "== JA4 SSL extractor (ASan+UBSan) =="
+    env $SAN_RUN "$BIN_JA4X" "$@" || rc=1
 else
     echo "JA4 extractor unit test COMPILE FAILED"; rc=1
 fi
@@ -76,9 +98,9 @@ fi
 
 # ---- scanner/match core (real PCRE2 match/depth-limit fix) ---------------
 BIN_MATCH="$TMP/heavybag-test-match"
-if "$CC" -DHEAVYBAG_MATCH_UNIT_TEST $COMMON "$DIR/test-match.c" -lpcre2-8 -o "$BIN_MATCH"; then
-    echo "== scanner/match core =="
-    "$BIN_MATCH" "$@" || rc=1
+if "$CC" -DHEAVYBAG_MATCH_UNIT_TEST $COMMON $SAN "$DIR/test-match.c" -lpcre2-8 -o "$BIN_MATCH"; then
+    echo "== scanner/match core (ASan+UBSan) =="
+    env $SAN_RUN "$BIN_MATCH" "$@" || rc=1
 else
     echo "match unit test COMPILE FAILED"; rc=1
 fi

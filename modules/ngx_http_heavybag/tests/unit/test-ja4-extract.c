@@ -56,8 +56,16 @@ typedef struct ngx_pool_s ngx_pool_t;     /* opaque: the extractor only passes i
 #define ngx_strlen(s)         strlen((const char *) (s))
 
 /* ngx_pnalloc: the extractor allocates out->data from the connection pool. A
- * short-lived test process can just malloc (read the result, then exit). */
-static void *ngx_pnalloc(ngx_pool_t *pool, size_t n) { (void) pool; return malloc(n); }
+ * short-lived test process can just malloc (read the result, then exit).
+ * g_pnalloc_fail forces a single NULL return so a vector can drive the
+ * extractor's `dst == NULL -> goto cleanup` error path (L12). */
+static int g_pnalloc_fail = 0;
+static void *ngx_pnalloc(ngx_pool_t *pool, size_t n)
+{
+    (void) pool;
+    if (g_pnalloc_fail) { return NULL; }
+    return malloc(n);
+}
 
 /* --- mock SSL ClientHello state ------------------------------------------- */
 /* struct ssl_st is only forward-declared by <openssl/types.h>; we define the
@@ -365,6 +373,72 @@ CTEST(ja4x, null_out_is_error)
     /* non-NULL ssl + non-NULL pool + NULL out -> isolates the out==NULL guard. */
     ASSERT_EQUAL(NGX_ERROR,
         (int) ngx_http_heavybag_ja4_compute((SSL *) &s, (ngx_pool_t *) dummy_arena, NULL));
+}
+
+
+/* ===== array-fill caps + odd-end + error path (CWE-125/787/401) ========== */
+
+/* >256 extension ids: the n_ext < HEAVYBAG_JA4_MAX_ELEMS cap must stop the
+ * exts[256] fill. Under ASan a broken cap is a hard stack-buffer-overflow;
+ * the count field clamps to 99 (mirrors cipher_count_over_max_clamps). */
+CTEST(ja4x, ext_count_over_max_clamps)
+{
+    static int  many[400];
+    char j[64], f[8];
+    for (int i = 0; i < 400; i++) { many[i] = 0x0100 + i; }   /* distinct, non-GREASE */
+    INIT_SSL(s); s.exts = many; s.exts_n = 400;
+    ASSERT_TRUE(run_ja4(&s, j) > 0);   /* no over-write of exts[HEAVYBAG_JA4_MAX_ELEMS] */
+    field(j, 6, 2, f);
+    ASSERT_STR("99", f);               /* ext count field clamped to 99 */
+}
+
+/* signature_algorithms with an ODD `end`: list length 0x0003 -> end = 2 + 3 = 5
+ * == len. The loop `i + 1 < end` reads EXACTLY ONE entry (p[2..3]=0x0403) at
+ * i=2 and stops at i=4 (4+1 < 5 is false), dropping the dangling byte p[4]. A
+ * regressed bound (`i + 1 <= end`) would read p[4..5] -- p[5] is one past this
+ * EXACTLY-5-byte heap allocation, so ASan flags a heap-buffer-overflow. The
+ * even-`end` vectors above could mask such an off-by-one; this one cannot. */
+CTEST(ja4x, sigalgs_odd_end_exact_count)
+{
+    unsigned char  *sa = malloc(5);
+    char            j_odd[64], j_clean[64];
+
+    ASSERT_NOT_NULL(sa);
+    sa[0] = 0x00; sa[1] = 0x03; sa[2] = 0x04; sa[3] = 0x03; sa[4] = 0x08;
+    INIT_SSL(a);
+    a.ext[0].type = 0x000d; a.ext[0].data = sa; a.ext[0].len = 5; a.next_ext = 1;
+    a.exts = (int[]){ 0x000d }; a.exts_n = 1;
+    ASSERT_TRUE(run_ja4(&a, j_odd) > 0);
+    free(sa);
+
+    /* EXACT count proof: a clean list carrying exactly that one sigalg (0x0403)
+     * with identical extensions -> identical JA4_c. Had the trailing 0x08 been
+     * (mis)read as a half/whole entry, n_sig would differ and JA4_c with it. */
+    {
+        static const unsigned char clean[] = { 0x00, 0x02, 0x04, 0x03 };  /* list=2, 1 entry */
+        INIT_SSL(b);
+        b.ext[0].type = 0x000d; b.ext[0].data = clean; b.ext[0].len = sizeof(clean); b.next_ext = 1;
+        b.exts = (int[]){ 0x000d }; b.exts_n = 1;
+        ASSERT_TRUE(run_ja4(&b, j_clean) > 0);
+        ASSERT_TRUE(memcmp(j_odd + 24, j_clean + 24, 12) == 0);   /* EXACTLY one sigalg */
+    }
+}
+
+/* error path: with extensions present (ext_ids ALLOCATED), force the out->data
+ * allocation to fail so the extractor takes `goto cleanup` with rc=NGX_ERROR.
+ * ext_ids must STILL be freed on this error path (CWE-401), not just on success.
+ * The existing null_out_is_error test returns before ext_ids is ever allocated,
+ * so it cannot prove the cleanup-label free fires on a mid-function failure. */
+CTEST(ja4x, error_path_frees_ext_ids)
+{
+    char j[64];
+    int  rc;
+    INIT_SSL(s); s.exts = (int[]){ 0x0000, 0x0005 }; s.exts_n = 2;   /* ext_ids allocated */
+    g_pnalloc_fail = 1;             /* dst = ngx_pnalloc(...) returns NULL -> goto cleanup */
+    rc = run_ja4(&s, j);
+    g_pnalloc_fail = 0;
+    ASSERT_EQUAL(-1, rc);           /* extractor returned NGX_ERROR via the cleanup label */
+    ASSERT_EQUAL(1, s.ext_freed);   /* ext_ids reclaimed on the ERROR path too */
 }
 
 
