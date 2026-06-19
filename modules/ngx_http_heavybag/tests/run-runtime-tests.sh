@@ -148,11 +148,26 @@ else
     bad "C2 counter reset/lost across reload: total $R0 -> $R1 (want >= $WANT = persisted+storm)"
 fi
 
-# a fresh scanner hit after the storm still blocks (rule set intact post-reload)
+# positive liveness after the storm: a non-scanner path must SERVE 200. This
+# directly catches a worker that died or stopped accepting connections during
+# the reload storm -- a failure the old scanner check missed because it accepted
+# "000" (curl connect failure) as a pass. /index.html is a static file under the
+# conf's root (sandbox/html/index.html), reached via `location /`, so a healthy
+# worker always answers 200.
+live=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:28612/index.html")
+[ "$live" = "200" ] \
+    && ok "C2 worker still serving after storm (/index.html -> 200)" \
+    || bad "C2 worker not serving after reload storm (/index.html -> $live, want 200)"
+
+# a fresh scanner hit after the storm still blocks with the DETERMINISTIC 403 the
+# rule set defines (lists/scanners.list: '^/phpmyadmin/ 403'). On a healthy
+# post-reload worker this is EXACTLY 403 -- 000 (connect fail), 404 (not served)
+# and 444 (connection dropped) are dead-worker / misconfig symptoms, NOT valid
+# substitutes, so they must FAIL here.
 bHit=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:28612/phpmyadmin/")
-[ "$bHit" = "403" ] || [ "$bHit" = "404" ] || [ "$bHit" = "444" -o "$bHit" = "000" ] \
-    && ok "C2 scanner rule still enforced after storm (/phpmyadmin/ -> $bHit)" \
-    || bad "C2 scanner rule lost after reload (/phpmyadmin/ -> $bHit)"
+[ "$bHit" = "403" ] \
+    && ok "C2 scanner rule still enforced after storm (/phpmyadmin/ -> 403)" \
+    || bad "C2 scanner rule lost/worker unhealthy after reload (/phpmyadmin/ -> $bHit, want 403)"
 
 badlog=$(logclean "$RLOG")
 [ -z "$badlog" ] && ok "C2 reload error log clean (no emerg/not-binary-compatible/crash)" \
