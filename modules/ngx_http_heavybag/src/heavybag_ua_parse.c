@@ -640,6 +640,35 @@ ngx_http_heavybag_vendor_str(ngx_http_heavybag_ua_vendor_e v)
 }
 
 
+/* ===================================================================== *
+ *  Spoof verdict combine (pure -- un-gated so the unit build sees it)    *
+ * ===================================================================== */
+
+/*
+ * Combine the two spoof signals into the is_spoofed verdict. ja4_signal is
+ * derived here: a TLS request whose JA4 coarse family contradicts the UA's
+ * expected family. BOTH families must be known -- an unknown JA4 (absent /
+ * ambiguous) or an unmapped UA browser yields no signal (no false positives).
+ * The caller passes UNKNOWN/UNKNOWN when no JA4 is present, which collapses
+ * ja4_signal to 0 (the short-circuit the wrapper used to do inline). The
+ * request-bound cidr_signal is computed by the caller and OR'd in here.
+ *
+ * Pure: no request / connection state, so it is unit-testable in isolation.
+ */
+ngx_uint_t
+ngx_http_heavybag_spoof_combine(ngx_http_heavybag_tls_family_e fam_ja4,
+    ngx_http_heavybag_tls_family_e fam_ua, ngx_uint_t cidr_signal)
+{
+    ngx_uint_t  ja4_signal;
+
+    ja4_signal = (fam_ja4 != HEAVYBAG_TLSFAM_UNKNOWN
+                  && fam_ua != HEAVYBAG_TLSFAM_UNKNOWN
+                  && fam_ja4 != fam_ua) ? 1 : 0;
+
+    return (ja4_signal || cidr_signal) ? 1 : 0;
+}
+
+
 #ifndef HEAVYBAG_UA_PARSE_UNIT_TEST
 
 /* ===================================================================== *
@@ -731,7 +760,7 @@ ngx_http_heavybag_ua_spoof_eval(ngx_http_request_t *r, ngx_http_heavybag_loc_con
     ngx_http_heavybag_tls_family_e  fam_ja4, fam_ua;
     struct sockaddr           *sa;
     ngx_str_t                  ja4;
-    ngx_uint_t                 ja4_signal, cidr_signal;
+    ngx_uint_t                 cidr_signal;
 
     if (ctx->spoof_evaluated) {
         return;
@@ -741,22 +770,19 @@ ngx_http_heavybag_ua_spoof_eval(ngx_http_request_t *r, ngx_http_heavybag_loc_con
         ngx_http_heavybag_ua_parse(r, wlcf, ctx);
     }
 
-    /* ja4_signal: TLS request whose JA4 family contradicts the UA family.
-     * The JA4 is read on demand from the SSL connection ex-data -- NOT from a
-     * phase-populated ctx field -- so the signal survives internal redirects and
-     * a server-off / location-on config split that skip POST_READ. Both families
-     * must be known; an unknown JA4 (absent/ambiguous) or an unmapped UA browser
-     * yields no signal (avoids false positives). */
-    ja4_signal = 0;
+    /* ja4 families: the JA4 is read on demand from the SSL connection ex-data
+     * -- NOT from a phase-populated ctx field -- so the signal survives
+     * internal redirects and a server-off / location-on config split that skip
+     * POST_READ. Resolve both families ONLY when a JA4 is present; otherwise
+     * pass UNKNOWN/UNKNOWN so ngx_http_heavybag_spoof_combine() yields no ja4
+     * signal (the short-circuit preserved byte-for-byte). The contradiction
+     * test itself lives in the pure combine fn. */
+    fam_ja4 = HEAVYBAG_TLSFAM_UNKNOWN;
+    fam_ua = HEAVYBAG_TLSFAM_UNKNOWN;
     ngx_http_heavybag_ja4_fetch(r, &ja4);
     if (ja4.len > 0) {
         fam_ja4 = ngx_http_heavybag_ja4_family(wlcf, &ja4);
         fam_ua = ngx_http_heavybag_ua_expected_tls_family(ctx->ua_browser);
-        if (fam_ja4 != HEAVYBAG_TLSFAM_UNKNOWN && fam_ua != HEAVYBAG_TLSFAM_UNKNOWN
-            && fam_ja4 != fam_ua)
-        {
-            ja4_signal = 1;
-        }
     }
 
     /* cidr_signal: UA claims a verified-bot class with a configured CIDR list
@@ -773,7 +799,7 @@ ngx_http_heavybag_ua_spoof_eval(ngx_http_request_t *r, ngx_http_heavybag_loc_con
         }
     }
 
-    ctx->is_spoofed = (ja4_signal || cidr_signal) ? 1 : 0;
+    ctx->is_spoofed = ngx_http_heavybag_spoof_combine(fam_ja4, fam_ua, cidr_signal);
     ctx->spoof_evaluated = 1;
 }
 

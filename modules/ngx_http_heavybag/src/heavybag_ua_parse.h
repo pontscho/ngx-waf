@@ -102,4 +102,21 @@ ngx_http_heavybag_tls_family_e ngx_http_heavybag_ua_expected_tls_family(
     ngx_http_heavybag_ua_browser_e b);
 
 
+/**
+ * Combine the JA4-vs-UA family contradiction and the verified-bot CIDR signal
+ * into the is_spoofed verdict. Pure (no request/connection state): the caller
+ * resolves the two coarse families (passing HEAVYBAG_TLSFAM_UNKNOWN for either
+ * when unavailable, which suppresses the JA4 signal) and the request-bound
+ * cidr_signal, and this folds them. Extracted from ngx_http_heavybag_ua_spoof_eval
+ * so the contradiction logic is unit-testable in isolation.
+ *
+ * @param fam_ja4     coarse TLS family observed from the JA4 (or UNKNOWN)
+ * @param fam_ua      coarse TLS family the UA browser should present (or UNKNOWN)
+ * @param cidr_signal 1 if the UA claims a verified-bot class off its CIDR list
+ * @return 1 if spoofed (either signal fires), else 0
+ */
+ngx_uint_t ngx_http_heavybag_spoof_combine(ngx_http_heavybag_tls_family_e fam_ja4,
+    ngx_http_heavybag_tls_family_e fam_ua, ngx_uint_t cidr_signal);
+
+
 #endif /* _HEAVYBAG_UA_PARSE_H_INCLUDED_ */

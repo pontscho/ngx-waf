@@ -371,14 +371,14 @@ CTEST(ja4_family, empty_table_or_key_is_unknown)
  *  ja4_signal contradiction logic (the TLS half of is_spoofed)          *
  * ===================================================================== */
 
-/* Mirror of the boolean the nginx wrapper computes: both families known and
- * different => spoof. */
+/* Drives the REAL extracted combine fn (no longer a reimplementation): map the
+ * UA browser to its expected family, then fold with cidr_signal=0 to isolate
+ * the JA4-contradiction half of the verdict. */
 static int
 ja4_signal(ngx_http_heavybag_tls_family_e fam_ja4, ngx_http_heavybag_ua_browser_e b)
 {
     ngx_http_heavybag_tls_family_e  fam_ua = ngx_http_heavybag_ua_expected_tls_family(b);
-    return fam_ja4 != HEAVYBAG_TLSFAM_UNKNOWN && fam_ua != HEAVYBAG_TLSFAM_UNKNOWN
-           && fam_ja4 != fam_ua;
+    return (int) ngx_http_heavybag_spoof_combine(fam_ja4, fam_ua, 0);
 }
 
 CTEST(spoof, tool_ja4_with_chrome_ua_is_spoof)
@@ -404,6 +404,49 @@ CTEST(spoof, unmapped_ua_is_not_spoof)
     /* a UA browser with no stable TLS family (msie) never triggers */
     ASSERT_FALSE(ja4_signal(HEAVYBAG_TLSFAM_CHROMIUM, HEAVYBAG_BROWSER_MSIE));
 }
+
+/* Full {CHROMIUM,FIREFOX,SAFARI,TOOL,UNKNOWN}^2 x cidr_signal{0,1} domain of
+ * the extracted ngx_http_heavybag_spoof_combine(): ja4_signal fires iff both
+ * families are known and DIFFER; the verdict is that OR'd with cidr_signal.
+ * The expected boolean is recomputed independently from the contract. */
+CTEST(spoof, combine_full_matrix)
+{
+    static const ngx_http_heavybag_tls_family_e  fams[] = {
+        HEAVYBAG_TLSFAM_UNKNOWN, HEAVYBAG_TLSFAM_CHROMIUM, HEAVYBAG_TLSFAM_FIREFOX,
+        HEAVYBAG_TLSFAM_SAFARI,  HEAVYBAG_TLSFAM_TOOL
+    };
+    size_t      i, j, c;
+
+    for (i = 0; i < sizeof(fams) / sizeof(fams[0]); i++) {
+        for (j = 0; j < sizeof(fams) / sizeof(fams[0]); j++) {
+            for (c = 0; c <= 1; c++) {
+                int ja4_sig = (fams[i] != HEAVYBAG_TLSFAM_UNKNOWN
+                               && fams[j] != HEAVYBAG_TLSFAM_UNKNOWN
+                               && fams[i] != fams[j]);
+                ngx_uint_t  exp = (ja4_sig || c) ? 1 : 0;
+                ASSERT_EQUAL_U(exp,
+                    ngx_http_heavybag_spoof_combine(fams[i], fams[j],
+                                                    (ngx_uint_t) c));
+            }
+        }
+    }
+}
+
+/* cidr_signal is an independent OR term: it forces a spoof verdict even when
+ * the families match (or are both unknown), and its absence never invents one. */
+CTEST(spoof, cidr_signal_is_independent_or)
+{
+    /* matching families, no JA4 signal, but cidr fires -> spoofed */
+    ASSERT_EQUAL_U(1, ngx_http_heavybag_spoof_combine(
+        HEAVYBAG_TLSFAM_CHROMIUM, HEAVYBAG_TLSFAM_CHROMIUM, 1));
+    /* both unknown + cidr=1 -> spoofed (cidr independent of JA4) */
+    ASSERT_EQUAL_U(1, ngx_http_heavybag_spoof_combine(
+        HEAVYBAG_TLSFAM_UNKNOWN, HEAVYBAG_TLSFAM_UNKNOWN, 1));
+    /* both unknown + cidr=0 -> clean */
+    ASSERT_EQUAL_U(0, ngx_http_heavybag_spoof_combine(
+        HEAVYBAG_TLSFAM_UNKNOWN, HEAVYBAG_TLSFAM_UNKNOWN, 0));
+}
+
 
 /* ===================================================================== *
  *  watchOS OS detection (L5 fix)                                        *
