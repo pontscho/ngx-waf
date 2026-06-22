@@ -102,7 +102,6 @@ phpunit/.{0,40}eval-stdin\.php
 ^/sitecore/
 ^/RDWeb/
 ^/evox/about
-^/parastable/
 (^|/)etc/passwd
 
 # ---- credential / config / infra-API leaks --------------------------------
