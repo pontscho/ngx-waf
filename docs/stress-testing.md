@@ -1,7 +1,7 @@
 ---
 name: stress-testing
 type: runbook
-status: current
+status: stale
 title: Stress & Load Testing Guide
 description: Operational how-to for running the heavybag stress/load campaign (install, run, tune, troubleshoot).
 sources:
@@ -271,3 +271,25 @@ After a reference run, copy the headline numbers from the per-scenario
 [`docs/stress-campaign.md`](stress-campaign.md), together with the machine header
 from any `summary.json`. The `.stress/` artifact dirs themselves are gitignored
 — the ledger is the durable record.
+
+---
+
+## 10. Live-edge testing (a running deployment)
+
+The S1–S5 harness above spins up its own sandbox nginx. To characterise a
+**live** edge instead (real box, real network path), use the manual runners in
+[`modules/ngx_http_heavybag/tests/live/`](../modules/ngx_http_heavybag/tests/live/)
+— see that directory's `README.md`:
+
+- **`live-slo-path.sh`** — vegeta constant-arrival SLO sweep from a gen host
+  against a remote URL, sampling the target's CPU over SSH. Finds the max req/s
+  where `p99 ≤ TARGET_MS`. The measured tail includes the network path.
+- **`live-slo-local.sh`** — run on the box against `127.0.0.1` to remove path
+  jitter and read the WAF's true latency; separates nginx CPU from the
+  co-located generator's.
+
+These are **not** CTest-wired (they need a target + SSH). The most recent live
+results, methodology, and caveats — including why loopback/internal sources are
+allowlist-bypassed and why `rate_overflow` is not reproducible from a single live
+vantage — are in [`docs/stress-campaign.md`](stress-campaign.md) under *Live
+production run*.

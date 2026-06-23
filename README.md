@@ -1142,6 +1142,73 @@ dimension SKIPs. Per-run artifacts (counter deltas, CPU/RSS timeseries, HDR
 histograms, `summary.json`) land under `tests/corpus/.stress/` (gitignored).
 </details>
 
+<details>
+<summary><b>Live production measurements (2026-06-23, example.com edge)</b></summary>
+
+Black-box load test of the **live** edge (`example.com` → 203.0.113.10, the
+Apache-cloaked heavybag; 6-core box, OpenSSL-QUIC build) from a separate host over
+a ~200 Mbit/s link (the box itself uplinks at 1 Gbit/s). Load tools: **h2load**
+(H1/H2) and **vegeta** (open-loop constant arrival — the only one of the two that
+reports true percentiles). Target is `GET /` → nginx **404**: the full WAF
+pipeline runs at `http{}` level, then a static 404 with **no upstream**, so the
+numbers isolate WAF + nginx + TLS, not any backend. The body is 274 B, so
+bandwidth never binds (~91k req/s of 404s would be needed to fill the link).
+Server CPU was sampled mid-load with `mpstat`/`pidstat` over ssh.
+
+**Rate limiter — real config `rate=30r/s burst=50 for_geo=HU`.** vegeta constant
+arrival; the generator's egress IP geolocates HU:
+
+| arrival | passed (404) | 429-share (measured) | theory `(R−30)/R` |
+|---|---|---|---|
+| 30 r/s | 30 r/s | 0 % | 0 % |
+| 60 r/s | 30 r/s | 49.9 % | 50 % |
+| 120 r/s | 30 r/s | 75.0 % | 75 % |
+
+Steady pass-rate pins to exactly 30 r/s, `burst≈50` absorbs the initial spike,
+and p99 stays < 15 ms on **both** the pass and the 429 path even at 4× overload.
+
+**Capacity & WAF overhead (rate disabled, `enforce`, over the path).** vegeta
+sweep with mid-load CPU on the 6-core box:
+
+| target req/s | p50 | p99 | all-cpu (6c) | nginx CPU |
+|---|---|---|---|---|
+| 800 | 2.7 ms | 16.8 ms | ~8 % | ~50 %/600 |
+| 2 000 | 3.4 ms | 91 ms | 26 % | 131 %/600 |
+| 4 000 | 13.9 ms | 1.57 s | 47 % | 252 %/600 |
+| 8 000 | 58 ms | 1.42 s | 77 % | 406 %/600 |
+| ~10–11k | — | — | **~100 %** | CPU-saturated |
+
+CPU-bound: all six cores peg around **10–11k req/s** (absolute h2load peak
+~43k req/s, deep in saturation with multi-second p99). `waf off` vs `enforce` at
+equal rate differ by only ~+20–40 % nginx CPU, widening to ~+1 core at 8k.
+
+**True serving latency (loopback, path jitter removed).** Same sweep on the box
+against `127.0.0.1` (vegeta co-located, so valid only ≤ ~2k req/s before the
+generator steals cores):
+
+| | p50 | p99 |
+|---|---|---|
+| `waf off`, 1 000 r/s | 0.71 ms | 9.8 ms |
+| `enforce`, 1 000 r/s | 0.73 ms | 7.2 ms |
+| `enforce`, 2 000 r/s | 0.67 ms | 25.0 ms |
+
+**The full WAF pipeline (geo + JA4 + UA-parse + list-match + rate bookkeeping)
+costs ~30 µs/request at the median** — lost in the ~0.7 ms TLS+nginx floor.
+
+**Operating point — p99 ≤ 25 ms:** ~800 req/s over the path, ~2 000 req/s on
+loopback. Both ceilings are set by the **measurement path** (network jitter /
+co-located generator CPU), not by heavybag — p50/p95 stay ~3–5 ms well past them.
+
+**Verdict: heavybag is effectively free.** Capacity is bound by the hardware
+(6 cores ≈ 10k req/s of 404 fast-path) and the network path; the WAF itself adds
+~30 µs/req of latency and a fraction of a core until near saturation.
+
+> Caveats: black-box over a bandwidth-limited path (the p99 tail is the path's,
+> not the server's); loopback CPU above ~2–4k req/s is confounded by the
+> co-located generator; numbers are machine- and path-specific, not a portable
+> benchmark.
+</details>
+
 ## Runtime behavior
 
 The HTTP head's per-request decision chain (cheap → expensive; the **first**

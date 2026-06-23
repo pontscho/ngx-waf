@@ -1,13 +1,15 @@
 ---
 name: stress-campaign
 type: analysis
-status: current
+status: stale
 title: Stress & Load Campaign Ledger
 description: Cross-session ledger of the reproducible stress/load campaign — scenarios, S3 counter invariants, and result tables.
 sources:
   - modules/ngx_http_heavybag/tests/run-stress-tests.sh
   - modules/ngx_http_heavybag/tests/stress/stress-lib.sh
   - modules/ngx_http_heavybag/tools/gen-stress-corpus.pl
+  - modules/ngx_http_heavybag/tests/live/live-slo-path.sh
+  - modules/ngx_http_heavybag/tests/live/live-slo-local.sh
 verified:
   commit: 7a935b0
   date: 2026-06-21
@@ -189,3 +191,107 @@ _Pending opt-in run. Leak gate: RSS least-squares slope ≤ 64 KiB/s._
 | Duration | reloads | RSS slope (KiB/s) | fd trend | verdict |
 |---|---|---|---|---|
 | | | | | |
+
+---
+
+# Live production run (2026-06-23, example.com edge)
+
+Black-box load test of the **live** edge, distinct from the sandbox S1–S5 harness
+above. Driven from a separate host with [`tests/live/live-slo-path.sh`](../modules/ngx_http_heavybag/tests/live/live-slo-path.sh)
+(over-the-network, SSH CPU sampling) and [`tests/live/live-slo-local.sh`](../modules/ngx_http_heavybag/tests/live/live-slo-local.sh)
+(on-box loopback). Tool: **vegeta** (open-loop constant arrival — true p99);
+h2load used for the closed-loop concurrency peak.
+
+**Machine / setup.** Target `example.com` → `203.0.113.10` (Apache-cloaked
+heavybag, 6-core box, OpenSSL-QUIC build). Generator on a separate host, ~200
+Mbit/s gen↔box path (box uplinks at 1 Gbit/s). Target request `GET /` → nginx
+**404** (full WAF pipeline at `http{}` level, then static 404, **no upstream**),
+body 274 B → bandwidth never binds (~91k req/s of 404s would fill the link).
+Server CPU sampled mid-load with `mpstat -P ALL` / `pidstat -C nginx`.
+
+**Deployed config at test time** (hardened vs the repo sample): `waf on`,
+`waf_rate_limit rate=30r/s burst=50 for_geo=HU` + `rate=10r/s burst=15` default,
+`waf_geo_whitelist HU LU`, `waf_allowlist 127.0.0.1/32` + `10.0.0.0/24`.
+Capacity/latency legs ran with the two `waf_rate_limit` lines temporarily
+commented (rate off) so throughput was not capped at 30 r/s; restored after.
+
+## Rate limiter (real config, public path, HU egress)
+
+vegeta constant arrival; the generator's public egress geolocates HU → 30 r/s rule.
+
+| arrival | passed (404) | 429-share (measured) | theory `(R−30)/R` |
+|---|---|---|---|
+| 30 r/s | 30 r/s | 0 % | 0 % |
+| 60 r/s | 30 r/s | 49.9 % | 50 % |
+| 120 r/s | 30 r/s | 75.0 % | 75 % |
+
+Steady pass-rate pins to exactly 30 r/s, `burst≈50` absorbs the spike, p99 < 15 ms
+on both the pass and the 429 path even at 4× overload. Surgical.
+
+## Capacity & WAF overhead (rate off, public path, vegeta sweep)
+
+| target req/s | p50 | p99 | all-cpu (6c) | nginx CPU | p99≤25 ms |
+|---|---|---|---|---|---|
+| 800 | 2.7 ms | 16.8 ms | ~8 % | ~50 %/600 | ✅ (SLO knee) |
+| 1 000 | 3.4 ms | 47 ms | 11 % | 58 %/600 | ❌ |
+| 2 000 | 3.4 ms | 91 ms | 26 % | 131 %/600 | ❌ |
+| 4 000 | 13.9 ms | 1.57 s | 47 % | 252 %/600 | ❌ |
+| 6 000 | 29 ms | 2.42 s | 60 % | 313 %/600 | ❌ |
+| 8 000 | 58 ms | 1.42 s | 77 % | 406 %/600 | ❌ |
+| ~10–11k | — | — | ~100 % | CPU-saturated | — |
+
+CPU-bound: six cores peg at ~10–11k req/s (absolute h2load closed-loop peak
+~43k req/s deep in saturation). `waf off` vs `enforce` at equal rate differ by
+only ~+20–40 % nginx CPU, widening to ~+1 core near 8k.
+
+## True serving latency (loopback, path jitter removed)
+
+`live-slo-local.sh` on the box vs `127.0.0.1` (taken **before** the
+`waf_allowlist 127.0.0.1/32` was added — see findings; valid only ≤ ~2k req/s
+before the co-located generator steals cores):
+
+| | p50 | p99 |
+|---|---|---|
+| `waf off`, 1 000 r/s | 0.71 ms | 9.8 ms |
+| `enforce`, 1 000 r/s | 0.73 ms | 7.2 ms |
+| `enforce`, 2 000 r/s | 0.67 ms | 25.0 ms |
+
+**Full WAF pipeline (geo + JA4 + UA-parse + list-match + rate bookkeeping) costs
+~30 µs/request at the median** — lost in the ~0.7 ms TLS+nginx floor.
+
+## Scanner block-path cost (public path, 25 r/s)
+
+| UA | p50 | p99 | verdict |
+|---|---|---|---|
+| benign (Firefox) | 4.1 ms | 38.8 ms¹ | geo-pass → location 404 |
+| scanner (sqlmap) | 3.7 ms | 5.4 ms | `bot_block` → 404 (`scanner_ua`) |
+
+The scanner path is **as cheap or cheaper** than the pass path — `waf_bot_block`
+short-circuits at `PREACCESS` before geo/scanner-path/location run. ¹benign p99 is
+small-sample path jitter, not server cost.
+
+## Findings
+
+- **Operating point @ p99 ≤ 25 ms:** ~800 req/s over the path, ~2 000 req/s on
+  loopback. Both ceilings are set by the **measurement path** (network jitter /
+  co-located generator CPU), **not** by heavybag — p50/p95 stay ~3–5 ms past them.
+- **Verdict: heavybag is effectively free.** Capacity is bound by the hardware
+  (6 cores ≈ 10k req/s of 404 fast-path) and the network path; the WAF adds
+  ~30 µs/req latency and a fraction of a core until near saturation.
+- **Allowlist short-circuits the whole WAF.** `waf_allowlist 127.0.0.1/32` +
+  `10.0.0.0/24` means loopback and the internal subnet (incl. the gen host)
+  bypass **all** checks incl. rate limiting — matched on the connection peer.
+  Consequence for testing: the **rate/WAF path is only exercisable from a
+  non-allowlisted source** (the public path). Loopback runs measure the WAF only
+  if the loopback IP is not allowlisted.
+- **`rate_overflow` (zone saturation) is not reproducible from a single live
+  vantage:** the 10 MB zone holds hundreds of thousands of slots, XFF-spoofing
+  many client IPs needs a `waf_trusted_proxy` peer (only loopback qualifies, and
+  loopback is allowlisted), and the public peer cannot spoof XFF. Saturation /
+  fail-open behaviour belongs in the **sandbox harness with a deliberately tiny
+  `waf_rate_zone`** (and the TSan rate-stress micro-bench), not the live edge.
+
+> Caveats: black-box over a bandwidth-limited path (the p99 tail is the path's,
+> not the server's); loopback CPU above ~2–4k req/s is confounded by the
+> co-located generator; numbers are machine- and path-specific, not a portable
+> benchmark.
