@@ -1179,8 +1179,23 @@ sweep with mid-load CPU on the 6-core box:
 | ~10–11k | — | — | **~100 %** | CPU-saturated |
 
 CPU-bound: all six cores peg around **10–11k req/s** (absolute h2load peak
-~43k req/s, deep in saturation with multi-second p99). `waf off` vs `enforce` at
-equal rate differ by only ~+20–40 % nginx CPU, widening to ~+1 core at 8k.
+~43k req/s, deep in saturation with multi-second p99).
+
+**CPU — `waf off` vs `enforce` at matched load** (same 6-core box, rate disabled,
+mid-load sample). `all-cpu` = mean busy across the 6 cores; `nginx` = summed
+worker CPU out of 600 % (= all cores):
+
+| req/s | all-cpu (off → on) | nginx CPU (off → on) | WAF Δ (nginx) |
+|---|---|---|---|
+| 1 000 | 10 % → 11 % | 51 % → 58 % | +7 % |
+| 2 000 | 20 % → 26 % | 104 % → 131 % | +27 % |
+| 4 000 | 42 % → 47 % | 218 % → 252 % | +34 % |
+| 6 000 | 50 % → 60 % | 272 % → 313 % | +41 % |
+| 8 000 | 58 % → 77 % | 296 % → 406 % | **+110 %** (~1.1 core) |
+
+The WAF's CPU cost is in the noise at low-mid load and only becomes material near
+saturation: ~+1 core of work at 8k req/s. (The 3k row is omitted — separate runs
+with 8 s samples put its per-point delta inside measurement noise.)
 
 **True serving latency (loopback, path jitter removed).** Same sweep on the box
 against `127.0.0.1` (vegeta co-located, so valid only ≤ ~2k req/s before the
