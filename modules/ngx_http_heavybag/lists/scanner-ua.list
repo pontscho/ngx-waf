@@ -33,3 +33,36 @@ InternetMeasurement
 Expanse
 l9explore
 l9tcpid
+# visionheight.com/scan -- recon scanner forging a desktop Chrome UA
+visionheight
+# Palo Alto Cortex Xpanse -- self-identifying internet-wide scanner
+paloaltonetworks
+# quic-go HTTP/3 client library -- recon/probe tool (quic-go-HTTP/3 UA)
+quic-go
+
+# -- 2026-06-23 live-log mining: self-identifying scanners / probe tools ----
+# RedTail crypto-miner / PHP-CGI RCE scanner (libredtail-http)
+libredtail
+# grpcurl -- gRPC server-reflection probe tool
+grpcurl
+# FreePBX-Scanner -- VoIP/PBX recon scanner
+FreePBX-Scanner
+# Odin internet scanner (docs.getodin.com)
+getodin
+# AssetCheck -- attack-surface scanner
+AssetCheck
+# Modat internet scanner (modat.io)
+ModatScanner
+# Recorded Future global inventory crawler (threat-intel recon)
+RecordedFuture
+
+# -- 2026-06-23 generic non-browser HTTP clients (someone's tool; geo is not
+# a reliable filter -- requests may originate from a whitelisted country) ---
+# Go standard-library HTTP client
+Go-http-client
+# Python requests library
+python-requests
+# Python aiohttp library
+aiohttp
+# curl / libcurl (also matches grpcurl, harmless)
+curl
